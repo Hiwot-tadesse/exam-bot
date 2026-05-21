@@ -7,11 +7,13 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ====================== ANSWERS LOADER ======================
+// ====================== ANSWERS ======================
 const answersCache: any = {};
 
 const courseToFileMap: { [key: string]: string } = {
-    'financial': 'finacial_litrecy',        // Fixed spelling
+    'financial': 'finacial_litrecy',
+    'finacial_litrecy': 'finacial_litrecy',
+    'financial literacy': 'finacial_litrecy',
     'communication': 'communications',
     'entrepreneurial': 'enterprunership',
     'customer': 'costomer_understanding',
@@ -48,7 +50,7 @@ function loadAnswers(courseName: string): string[] {
     return answers;
 }
 
-// ====================== MAIN BOT ======================
+// ====================== BOT ======================
 async function main() {
     console.log("🚀 Share eLearning Bot Started...\n");
 
@@ -59,7 +61,7 @@ async function main() {
         .on('end', async () => {
             for (const student of students) {
                 await processStudent(student);
-                await new Promise(r => setTimeout(r, 15000));
+                await new Promise(r => setTimeout(r, 12000));
             }
         });
 }
@@ -81,14 +83,14 @@ async function processStudent(student: any) {
         await page.fill('input[name="password"]', student.password || `${username}@R&D`);
         await page.click('button[type="submit"]');
 
-        await page.waitForTimeout(6000);
+        await page.waitForTimeout(7000);
         await page.goto('https://learn.share.com.et/my/courses.php', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(8000);
 
         const viewBtn = page.locator('button:has-text("View Course"), a:has-text("View Course")').first();
         await viewBtn.click({ force: true }).catch(() => {});
 
-        await page.waitForTimeout(8000);
+        await page.waitForTimeout(10000);
 
         const courseTitle = await page.locator('h1').first().innerText().catch(() => 'Unknown');
         console.log(`📘 Course: ${courseTitle}`);
@@ -106,60 +108,64 @@ async function processStudent(student: any) {
 async function startCourseProgress(page: any, answers: string[] = []) {
     let loop = 0;
 
-    while (loop < 70) {
+    while (loop < 100) {
         loop++;
-        await page.waitForTimeout(4000);
+        await page.waitForTimeout(4500);
 
-        console.log(`🔄 Loop ${loop} - Looking for main መማር ይቀጥሉ...`);
+        console.log(`🔄 Loop ${loop} - Searching for መማር ይቀጥሉ...`);
 
-        // === BETTER SELECTORS - Prioritize the main bottom button ===
-        const mainContinueSelectors = [
-            'button:has-text("መማር ይቀጥሉ"):visible',           // Most important
-            'div.green-button:has-text("መማር ይቀጥሉ")',
-            'button[style*="background-color: rgb(0, 166, 81)"]', 
-            'text=መማር ይቀጥሉ >> xpath=//button',
+        // Multiple selectors for both types of buttons
+        const selectors = [
             'button:has-text("መማር ይቀጥሉ")',
-            '*:has-text("መማር ይቀጥሉ")'  // Fallback: any element with the text
+            'text=መማር ይቀጥሉ',
+            'button[style*="rgb(0, 166, 81)"]',
+            'div[style*="background-color"] button:has-text("መማር ይቀጥሉ")',
+            '*:has-text("መማር ይቀጥሉ") >> button',
+            '.btn-success'
         ];
 
         let clicked = false;
 
-        for (const sel of mainContinueSelectors) {
+        for (const sel of selectors) {
             try {
-                const btn = page.locator(sel).first();
-                const isVisible = await btn.isVisible({ timeout: 3500 }).catch(() => false);
-                
-                if (isVisible) {
-                    console.log(`✅ Clicking MAIN button: ${sel}`);
-                    await btn.scrollIntoViewIfNeeded();
-                    await btn.click({ timeout: 12000 });
-                    clicked = true;
-                    await page.waitForTimeout(7000);
-                    break;
+                const btns = page.locator(sel);
+                const count = await btns.count();
+
+                for (let i = 0; i < count; i++) {
+                    const btn = btns.nth(i);
+                    if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+                        console.log(`✅ Clicking button: ${sel}`);
+                        await btn.scrollIntoViewIfNeeded();
+                        await btn.click({ timeout: 12000, force: true });
+                        clicked = true;
+                        await page.waitForTimeout(7000);
+                        break;
+                    }
                 }
-            } catch (e) {
-                console.log(`  ❌ Selector failed: ${sel} - ${e.message}`);
-            }
+                if (clicked) break;
+            } catch (e) {}
         }
 
         if (!clicked) {
-            console.log("⚠️ Main continue button not found");
+            console.log("⚠️ No መማር ይቀጥሉ button found");
+            await page.screenshot({ path: `debug-no-btn-${loop}.png` }).catch(() => {});
         }
 
         await autoSkipVideo(page);
 
-        // Check for Exam Button
+        // Check for Exam Start
         const examBtn = page.locator('text=ፈተናውን ይጀምሩ, button:has-text("ፈተና")').first();
         if (await examBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log("📝 Starting Exam...");
+            console.log("📝 Starting Final Exam...");
             await examBtn.click();
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(6000);
             await takeQuiz(page, answers);
             break;
         }
 
-        if (await page.locator('text=እንኳን ደስ, Completed').count() > 0) {
-            console.log("🎉 Course Completed!");
+        // Check if finished
+        if (await page.locator('text=እንኳን ደስ, Completed, አልቋል').count() > 0) {
+            console.log("🎉 Course Completed Successfully!");
             break;
         }
     }
@@ -178,15 +184,15 @@ async function autoSkipVideo(page: any) {
 async function takeQuiz(page: any, answers: string[]) {
     console.log("🧠 Taking 3-question test...");
     for (let q = 0; q < 3; q++) {
-        await page.waitForTimeout(3500);
+        await page.waitForTimeout(4000);
         const answer = answers[q] || 'ለ';
         console.log(`Q${q+1} → ${answer}`);
 
-        const options = page.locator('label, .option, input[type="radio"]');
+        const options = page.locator('label, input[type="radio"]');
         const idx = ['ለ','ሀ','A'].includes(answer) ? 0 : 
                     ['ሐ','U','B'].includes(answer) ? 1 : 2;
 
-        await options.nth(idx).click().catch(() => options.first().click().catch(() => {}));
+        await options.nth(idx).click().catch(() => options.first().click());
         await page.click('text=ቀጣይ, button:has-text("Submit"), button:has-text("Next")').catch(() => {});
     }
     console.log("✅ Test Completed!");
