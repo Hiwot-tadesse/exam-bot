@@ -6,53 +6,653 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const BOT_VERSION = 'v8-fast-continue';
+const CONTINUE_POLL_MS = 350;
+const CONTINUE_POST_CLICK_MS = 1500;
+const DEBUG_LOG = path.join(__dirname, 'debug-93bca3.log');
+
+function debugLog(payload: Record<string, unknown>) {
+    const line = JSON.stringify({ sessionId: '93bca3', timestamp: Date.now(), ...payload }) + '\n';
+    for (const logPath of [DEBUG_LOG, path.join(process.cwd(), 'debug-93bca3.log')]) {
+        try { fs.appendFileSync(logPath, line); } catch {}
+    }
+    fetch('http://127.0.0.1:7785/ingest/033e1045-1a8d-439a-aec7-78fd76285c5f', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '93bca3' },
+        body: line.trim(),
+    }).catch(() => {});
+}
 
 // ====================== ANSWERS ======================
 const answersCache: any = {};
 
+/** Keywords (longest first) → answers/*.csv basename */
 const courseToFileMap: { [key: string]: string } = {
-    'financial': 'finacial_litrecy',
-    'finacial_litrecy': 'finacial_litrecy',
+    'legal foundation & regulation': 'legal_foundation',
+    'legal foundation and regulation': 'legal_foundation',
+    'entrepreneurial mindset': 'enterprunership',
+    'communication skill': 'communications',
     'financial literacy': 'finacial_litrecy',
+    'customer understanding': 'costomer_understanding',
+    'negotiation skill': 'negotiations_skill',
+    'negotiations skill': 'negotiations_skill',
+    'design thinking': 'design_thinking',
+    'decision making': 'decision_making',
+    'legal foundation': 'legal_foundation',
+    'financial': 'finacial_litrecy',
+    'finacial': 'finacial_litrecy',
+    'finance': 'finacial_litrecy',
+    'literacy': 'finacial_litrecy',
     'communication': 'communications',
+    'communications': 'communications',
     'entrepreneurial': 'enterprunership',
+    'entrepreneurship': 'enterprunership',
+    'enterprunership': 'enterprunership',
     'customer': 'costomer_understanding',
+    'costomer': 'costomer_understanding',
+    'bookkeeping': 'bookkeeping',
     'book': 'bookkeeping',
     'design': 'design_thinking',
     'decision': 'decision_making',
     'marketing': 'marketing',
     'negotiation': 'negotiations_skill',
-    'legal': 'legal_foundation'
+    'negotiations': 'negotiations_skill',
+    'legal': 'legal_foundation',
 };
 
-function loadAnswers(courseName: string): string[] {
-    if (answersCache[courseName]) return answersCache[courseName];
+const answersDir = path.join(__dirname, 'answers');
 
-    const key = courseName.toLowerCase();
-    let fileName = courseToFileMap[key] || key.replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, '_');
+function listAnswerFiles(): string[] {
+    if (!fs.existsSync(answersDir)) return [];
+    return fs.readdirSync(answersDir)
+        .filter((f) => f.endsWith('.csv'))
+        .map((f) => f.slice(0, -4));
+}
 
-    const csvPath = path.join(__dirname, 'answers', `${fileName}.csv`);
-    
-    if (!fs.existsSync(csvPath)) {
-        console.log(`⚠️ Answers file not found: ${fileName}.csv`);
+function normalizeText(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function extractEnglishTitle(courseName: string): string {
+    const paren = courseName.match(/\(([^)]+)\)/);
+    if (paren) return normalizeText(paren[1]);
+    return normalizeText(courseName.replace(/[\u1200-\u137F]/g, ' '));
+}
+
+function scoreCourseToFile(courseName: string, fileBase: string): number {
+    const blob = normalizeText(courseName);
+    const english = extractEnglishTitle(courseName);
+    const fileNorm = normalizeText(fileBase.replace(/_/g, ' '));
+    const fileSlug = fileBase.toLowerCase();
+    let score = 0;
+
+    const mapKeys = Object.keys(courseToFileMap).sort((a, b) => b.length - a.length);
+    for (const key of mapKeys) {
+        if (courseToFileMap[key] !== fileBase) continue;
+        if (blob.includes(key) || english.includes(key)) score += 60 + key.length;
+    }
+
+    if (english && (english === fileNorm || fileNorm.includes(english) || english.includes(fileNorm))) {
+        score += 90;
+    }
+
+    const englishSlug = english.replace(/\s+/g, '_');
+    if (englishSlug && (englishSlug === fileSlug || fileSlug.includes(englishSlug) || englishSlug.includes(fileSlug))) {
+        score += 85;
+    }
+
+    const blobWords = [...new Set([...blob.split(' '), ...english.split(' ')])].filter((w) => w.length > 2);
+    const fileWords = fileSlug.replace(/_/g, ' ').split(' ').filter((w) => w.length > 2);
+    for (const fw of fileWords) {
+        if (blobWords.some((bw) => bw.includes(fw) || fw.includes(bw))) score += 18;
+    }
+
+    return score;
+}
+
+function resolveAnswerFileName(courseName: string): string | null {
+    const files = listAnswerFiles();
+    if (!files.length) return null;
+
+    let bestFile = '';
+    let bestScore = 0;
+    for (const file of files) {
+        const score = scoreCourseToFile(courseName, file);
+        if (score > bestScore) {
+            bestScore = score;
+            bestFile = file;
+        }
+    }
+
+    if (bestScore >= 20) return bestFile;
+    return null;
+}
+
+async function loadAnswers(courseName: string): Promise<string[]> {
+    if (answersCache[courseName]?.length) return answersCache[courseName];
+
+    const fileName = resolveAnswerFileName(courseName);
+    const available = listAnswerFiles();
+
+    // #region agent log
+    debugLog({
+        hypothesisId: 'H1',
+        location: 'bot.ts:loadAnswers',
+        message: 'resolve answers file',
+        data: { courseName, fileName, available, scores: available.map((f) => ({ f, s: scoreCourseToFile(courseName, f) })) },
+    });
+    // #endregion
+
+    if (!fileName) {
+        console.log(`⚠️ No answer file matched for course: "${courseName}"`);
+        console.log(`   Available: ${available.join(', ')}`);
+        console.log(`   Exam will use default answers (ለ, ሐ, …)`);
         return [];
     }
 
-    const answers: string[] = [];
-    fs.createReadStream(csvPath)
-        .pipe(csv())
-        .on('data', (row) => {
-            const ans = row['total'] || row['answer'] || Object.values(row)[0];
-            if (ans) answers.push(ans.toString().trim());
-        })
-        .on('end', () => answersCache[courseName] = answers);
+    const csvPath = path.join(answersDir, `${fileName}.csv`);
+    if (!fs.existsSync(csvPath)) {
+        console.log(`⚠️ Answers file missing on disk: ${fileName}.csv`);
+        return [];
+    }
 
-    return answers;
+    console.log(`📋 Answers loaded from: ${fileName}.csv (matched "${courseName}")`);
+
+    return new Promise((resolve) => {
+        const answers: string[] = [];
+        fs.createReadStream(csvPath)
+            .pipe(csv())
+            .on('data', (row) => {
+                const ans = row['total'] || row['answer'] || Object.values(row)[0];
+                if (ans) answers.push(ans.toString().trim());
+            })
+            .on('end', () => {
+                answersCache[courseName] = answers;
+                resolve(answers);
+            });
+    });
 }
 
-// ====================== BOT ======================
+function sortFramesByContent(frames: any[]): any[] {
+    const score = (url: string) => {
+        if (!url || url === 'about:blank') return 0;
+        if (/scormcontent/i.test(url)) return 5;
+        if (/h5p|scorm|articulate|storyline|course|mod|content|player/i.test(url)) return 3;
+        if (url.includes('learn.share.com.et')) return 2;
+        return 1;
+    };
+    return [...frames].sort((a, b) => score(b.url()) - score(a.url()));
+}
+
+type ClickOpts = { examMode?: boolean; continueMode?: boolean };
+
+function getScormContentFrame(page: any) {
+    return sortFramesByContent(page.frames()).find((f: any) => /scormcontent/i.test(f.url())) || null;
+}
+
+type QuizStats = { radioCount: number; choiceCount: number; optionCount: number; hasNext: boolean };
+
+async function getQuizStats(frame: any): Promise<QuizStats | null> {
+    try {
+        return await frame.evaluate(() => {
+            let radioCount = 0;
+            document.querySelectorAll('input[type="radio"]').forEach((r) => {
+                const rect = r.getBoundingClientRect();
+                const style = getComputedStyle(r);
+                if (rect.width > 0 && rect.height > 0 && style.display !== 'none') radioCount++;
+            });
+
+            const seen = new Set<string>();
+            let choiceCount = 0;
+            document.querySelectorAll('label, button, [role="radio"], [role="button"], div, span, li, p').forEach((el) => {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length > 6) return;
+                if (!/^[ለሐመሀረA-Ca-cUu]$/.test(t)) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 12 || rect.height < 12) return;
+                const key = `${t}:${Math.round(rect.top)}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    choiceCount++;
+                }
+            });
+
+            const hasNext = [...document.querySelectorAll('button, a, [role="button"]')].some((el) =>
+                /ቀጣይ|Submit|Next|Check|Continue|SUBMIT/i.test((el.textContent || '').trim())
+            );
+
+            return {
+                radioCount,
+                choiceCount,
+                optionCount: Math.max(radioCount, choiceCount),
+                hasNext,
+            };
+        });
+    } catch {
+        return null;
+    }
+}
+
+async function isQuizScreen(frame: any): Promise<boolean> {
+    const stats = await getQuizStats(frame);
+    return !!stats && stats.optionCount >= 2 && stats.hasNext;
+}
+
+function isMidQuizOptions(n: number) {
+    return n >= 2 && n <= 6;
+}
+
+function isFinalQuizOptions(n: number) {
+    return n >= 8;
+}
+
+async function clickAnswerByLetter(frame: any, answer: string): Promise<boolean> {
+    const letter = answer.trim().replace(/\s+/g, '');
+    if (!letter) return false;
+
+    const playwrightAttempts = [
+        () => frame.getByText(letter, { exact: true }).first().click({ force: true, timeout: 8000 }),
+        () => frame.locator('label').filter({ hasText: letter }).first().click({ force: true, timeout: 8000 }),
+        () => frame.locator(`[role="radio"]:has-text("${letter}")`).first().click({ force: true, timeout: 8000 }),
+        () => frame.locator(`button:has-text("${letter}")`).first().click({ force: true, timeout: 8000 }),
+    ];
+
+    for (let i = 0; i < playwrightAttempts.length; i++) {
+        try {
+            await playwrightAttempts[i]();
+            debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickAnswerByLetter', message: 'playwright click ok', data: { letter, attempt: i } });
+            return true;
+        } catch {}
+    }
+
+    try {
+        const result = await frame.evaluate((ans) => {
+            const norm = ans.trim().replace(/\s+/g, '');
+            const clickables = [...document.querySelectorAll('label, button, [role="radio"], div, span, li')];
+            for (const el of clickables) {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length > 30) continue;
+                if (t === norm || t.startsWith(norm + ' ') || t.startsWith(norm + '.') || t.startsWith(norm + ')')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 5 && rect.height > 5) {
+                        (el as HTMLElement).click();
+                        return { ok: true, via: `label:${t}` };
+                    }
+                }
+            }
+            const radios = [...document.querySelectorAll('input[type="radio"]')].filter((r) => {
+                const rect = r.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            });
+            const map: Record<string, number> = {
+                'ለ': 0, 'ሀ': 0, 'A': 0, 'a': 0,
+                'ሐ': 1, 'U': 1, 'B': 1, 'b': 1,
+                'መ': 2, 'ረ': 2, 'C': 2, 'c': 2,
+            };
+            const idx = map[norm] ?? map[norm.charAt(0)];
+            if (idx !== undefined && radios[idx]) {
+                radios[idx].click();
+                radios[idx].closest('label')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                return { ok: true, via: `radio:${idx}` };
+            }
+            return { ok: false };
+        }, letter);
+        return !!result?.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function clickQuizNext(frame: any): Promise<boolean> {
+    try {
+        const result = await frame.evaluate(() => {
+            const words = ['ቀጣይ', 'Submit', 'Next', 'Continue', 'SUBMIT', 'Check', 'Done', 'Finish'];
+            const nodes = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
+            for (const w of words) {
+                for (const el of nodes) {
+                    const t = (el.textContent || '').trim();
+                    if (!t.includes(w)) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 8 && rect.height > 8) {
+                        (el as HTMLElement).click();
+                        return { ok: true, text: t.slice(0, 40) };
+                    }
+                }
+            }
+            return { ok: false };
+        });
+        return !!result?.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function scanTextInFrames(page: any, text: string) {
+    const scan: { frameUrl: string; matchCount: number; visibleCount: number }[] = [];
+    for (const frame of sortFramesByContent(page.frames())) {
+        try {
+            const stats = await frame.evaluate((searchText) => {
+                let matchCount = 0;
+                let visibleCount = 0;
+                document.querySelectorAll('button, a, [role="button"], div, span, p, label').forEach((el) => {
+                    const t = (el.textContent || '').trim();
+                    if (!t.includes(searchText)) return;
+                    matchCount++;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    if (rect.width > 5 && rect.height > 5 && style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0.1) {
+                        visibleCount++;
+                    }
+                });
+                return { matchCount, visibleCount };
+            }, text);
+            scan.push({ frameUrl: frame.url(), ...stats });
+        } catch {
+            scan.push({ frameUrl: frame.url(), matchCount: -1, visibleCount: -1 });
+        }
+    }
+    return scan;
+}
+
+async function findBestClickTarget(frame: any, text: string, opts?: ClickOpts) {
+    try {
+        return await frame.evaluate(({ searchText, examMode, continueMode }) => {
+            const collect = (root: Document | ShadowRoot, out: Element[]) => {
+                root.querySelectorAll('button, a, [role="button"], div, span, p, label, input').forEach((el) => {
+                    out.push(el);
+                    if ((el as HTMLElement).shadowRoot) collect((el as HTMLElement).shadowRoot!, out);
+                });
+            };
+            const nodes: Element[] = [];
+            collect(document, nodes);
+
+            let best: { x: number; y: number; tag: string; sample: string; area: number } | null = null;
+            for (const el of nodes) {
+                const tag = el.tagName;
+                if ((examMode || continueMode) && !['BUTTON', 'A', 'INPUT'].includes(tag)) continue;
+
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (examMode) {
+                    if (t !== searchText && !t.endsWith(searchText)) continue;
+                    if (t.length > searchText.length + 8) continue;
+                } else if (!t.includes(searchText)) {
+                    continue;
+                }
+
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                if (rect.width < 8 || rect.height < 8) continue;
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                if (parseFloat(style.opacity) < 0.1) continue;
+                const area = rect.width * rect.height;
+                if (area > 250000) continue;
+                if (!best || area < best.area) {
+                    best = {
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                        tag,
+                        sample: t.slice(0, 80),
+                        area,
+                    };
+                }
+            }
+            return best;
+        }, { searchText: text, examMode: !!opts?.examMode, continueMode: !!opts?.continueMode });
+    } catch {
+        return null;
+    }
+}
+
+async function clickTargetInFrame(frame: any, target: { x: number; y: number; tag: string; sample: string }) {
+    await frame.evaluate((t) => {
+        const el = document.elementFromPoint(t.x, t.y) as HTMLElement | null;
+        el?.scrollIntoView?.({ block: 'center', inline: 'center' });
+    }, target);
+    await frame.mouse.click(target.x, target.y);
+    return { clicked: true, tag: target.tag, text: target.sample };
+}
+
+async function clickGreenStyledButton(page: any, textHint: string): Promise<{ clicked: boolean; frameUrl: string; method: string }> {
+    for (const frame of sortFramesByContent(page.frames())) {
+        const selectors = [
+            `button[style*="rgb(0, 166, 81)"]:has-text("${textHint}")`,
+            `button[style*="0, 166, 81)"]:has-text("${textHint}")`,
+            'button[style*="rgb(0, 166, 81)"]',
+        ];
+        for (const sel of selectors) {
+            const btn = frame.locator(sel).first();
+            if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+                await btn.scrollIntoViewIfNeeded().catch(() => {});
+                await btn.click({ timeout: 15000, force: true });
+                return { clicked: true, frameUrl: frame.url(), method: `green:${sel}` };
+            }
+        }
+    }
+    return { clicked: false, frameUrl: page.url(), method: 'none' };
+}
+
+async function clickTextInFrames(
+    page: any,
+    texts: string[],
+    opts?: ClickOpts
+): Promise<{ clicked: boolean; frameUrl: string; matchedText: string; method: string }> {
+    for (const text of texts) {
+        const scan = await scanTextInFrames(page, text);
+        // #region agent log
+        debugLog({ hypothesisId: opts?.examMode ? 'H3' : 'H2', location: 'bot.ts:scanTextInFrames', message: 'frame scan', data: { text, examMode: !!opts?.examMode, scan } });
+        // #endregion
+
+        if (!opts?.examMode) {
+            const green = await clickGreenStyledButton(page, text.slice(0, 8));
+            if (green.clicked) {
+                return { clicked: true, frameUrl: green.frameUrl, matchedText: text, method: green.method };
+            }
+        }
+
+        for (const frame of sortFramesByContent(page.frames())) {
+            const frameUrl = frame.url();
+            const target = await findBestClickTarget(frame, text, opts);
+            if (!target) continue;
+            try {
+                await clickTargetInFrame(frame, target);
+                return { clicked: true, frameUrl, matchedText: text, method: `mouse:${target.tag}` };
+            } catch {
+                if (!opts?.examMode && !opts?.continueMode) {
+                    try {
+                        await frame.evaluate((searchText) => {
+                            const collect = (root: Document | ShadowRoot, out: Element[]) => {
+                                root.querySelectorAll('button, a, [role="button"], div, span, p, label').forEach((el) => {
+                                    out.push(el);
+                                    if ((el as HTMLElement).shadowRoot) collect((el as HTMLElement).shadowRoot!, out);
+                                });
+                            };
+                            const nodes: Element[] = [];
+                            collect(document, nodes);
+                            let best: HTMLElement | null = null;
+                            let bestArea = Infinity;
+                            for (const el of nodes) {
+                                const t = (el.textContent || '').trim();
+                                if (!t.includes(searchText)) continue;
+                                const rect = el.getBoundingClientRect();
+                                const area = rect.width * rect.height;
+                                if (area < 8 || area > 250000 || area >= bestArea) continue;
+                                best = el as HTMLElement;
+                                bestArea = area;
+                            }
+                            best?.scrollIntoView({ block: 'center', inline: 'center' });
+                            best?.click();
+                        }, text);
+                        return { clicked: true, frameUrl, matchedText: text, method: `evaluate:${target.tag}` };
+                    } catch {}
+                }
+            }
+        }
+
+        for (const ctx of sortFramesByContent(page.frames())) {
+            const frameUrl = ctx.url();
+            const locators = opts?.examMode
+                ? [
+                    ctx.getByRole('button', { name: text, exact: true }),
+                    ctx.locator(`button:has-text("${text}")`),
+                    ctx.locator(`a:has-text("${text}")`),
+                ]
+                : [
+                    ctx.getByRole('button', { name: new RegExp(text.slice(0, 6)) }),
+                    ctx.getByRole('button', { name: text }),
+                    ctx.getByText(text),
+                    ctx.locator(`button:has-text("${text}")`),
+                    ctx.locator(`a:has-text("${text}")`),
+                ];
+            for (const loc of locators) {
+                const count = await loc.count().catch(() => 0);
+                for (let i = 0; i < count; i++) {
+                    const el = loc.nth(i);
+                    const visTimeout = opts?.continueMode || opts?.examMode ? 500 : 1500;
+                    if (!(await el.isVisible({ timeout: visTimeout }).catch(() => false))) continue;
+                    await el.scrollIntoViewIfNeeded().catch(() => {});
+                    await el.click({ timeout: 15000, force: true });
+                    return { clicked: true, frameUrl, matchedText: text, method: 'playwright' };
+                }
+            }
+        }
+    }
+    return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'none' };
+}
+
+async function waitAndClickContinue(page: any): Promise<{ clicked: boolean; frameUrl: string; matchedText: string; method: string }> {
+    const maxAttempts = 40;
+    const t0 = Date.now();
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) await page.waitForTimeout(CONTINUE_POLL_MS);
+
+        await autoSkipVideo(page);
+
+        const result = await clickTextInFrames(page, ['መማር ይቀጥሉ'], { continueMode: true });
+        if (result.clicked) {
+            // #region agent log
+            debugLog({
+                hypothesisId: 'H2',
+                location: 'bot.ts:waitAndClickContinue',
+                message: 'continue clicked',
+                data: { attempt, elapsedMs: Date.now() - t0, ...result },
+            });
+            // #endregion
+            return result;
+        }
+    }
+
+    return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'none' };
+}
+
+// ====================== COURSE PICKER (My courses grid) ======================
+type CourseCardInfo = { title: string; percent: number; completed: boolean; index: number };
+
+async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
+    return page.evaluate(() => {
+        const results: { title: string; percent: number; completed: boolean; index: number }[] = [];
+        const viewButtons = [...document.querySelectorAll('a, button')].filter((el) =>
+            /view course/i.test((el.textContent || '').trim())
+        );
+
+        viewButtons.forEach((btn, index) => {
+            let cardText = '';
+            let node: Element | null = btn;
+            for (let depth = 0; depth < 10 && node; depth++) {
+                node = node.parentElement;
+                if (!node) break;
+                const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                if (text.includes('(') && text.includes(')') && text.length > 40) {
+                    cardText = text;
+                }
+            }
+
+            const titleMatch = cardText.match(/([\u1200-\u137F][\u1200-\u137F\s]*)\s*\(([^)]+)\)/);
+            const title = titleMatch
+                ? `${titleMatch[1].trim()} (${titleMatch[2].trim()})`
+                : (cardText.match(/\(([^)]+)\)/)?.[0] ? cardText.slice(0, 120) : `Course ${index + 1}`);
+
+            const pctMatch = cardText.match(/(\d+)%\s*Course completed/i);
+            const percent = pctMatch ? parseInt(pctMatch[1], 10) : 0;
+            const completed = percent >= 100 || /100%\s*Course completed/i.test(cardText);
+
+            results.push({ title, percent, completed, index });
+        });
+
+        return results;
+    });
+}
+
+function courseMatchesPreference(cardTitle: string, preference: string): boolean {
+    const pref = normalizeText(preference);
+    const title = normalizeText(cardTitle);
+    const english = extractEnglishTitle(cardTitle);
+    return title.includes(pref) || pref.includes(english) || english.includes(pref)
+        || pref.split(' ').filter((w) => w.length > 3).every((w) => title.includes(w) || english.includes(w));
+}
+
+async function openCourseFromGrid(page: any, student: any): Promise<string> {
+    await page.waitForSelector('text=View Course', { timeout: 20000 });
+    const cards = await listCoursesOnPage(page);
+
+    // #region agent log
+    debugLog({ hypothesisId: 'H6', location: 'bot.ts:listCoursesOnPage', message: 'courses grid', data: { count: cards.length, cards } });
+    // #endregion
+
+    if (!cards.length) {
+        console.log('⚠️ No courses found on My courses page');
+        return 'Unknown';
+    }
+
+    const preference = (student.course || student.coursename || '').toString().trim();
+    let pickIndex = -1;
+
+    if (preference) {
+        pickIndex = cards.findIndex((c) => courseMatchesPreference(c.title, preference));
+        if (pickIndex >= 0) console.log(`🎯 Matched CSV course preference: "${preference}"`);
+    }
+
+    if (pickIndex < 0) {
+        const incomplete = cards.filter((c) => !c.completed && c.percent < 100);
+        const pool = incomplete.length ? incomplete : cards;
+        const randomCard = pool[Math.floor(Math.random() * pool.length)];
+        pickIndex = randomCard.index;
+        console.log(`🎲 Random course (${pool.length} available): ${randomCard.title}`);
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H6',
+            location: 'bot.ts:openCourseFromGrid',
+            message: 'random course pick',
+            data: { pickIndex, title: randomCard.title, poolSize: pool.length, pool: pool.map((c) => c.title) },
+        });
+        // #endregion
+    }
+
+    const picked = cards[pickIndex];
+    console.log(`📗 Opening [${pickIndex + 1}/${cards.length}]: ${picked.title} (${picked.percent}% done)`);
+
+    const viewButtons = page.locator('a:has-text("View Course"), button:has-text("View Course")');
+    await viewButtons.nth(pickIndex).scrollIntoViewIfNeeded().catch(() => {});
+    await viewButtons.nth(pickIndex).click({ force: true, timeout: 20000 });
+
+    await page.waitForTimeout(10000);
+    const h1Title = await page.locator('h1').first().innerText().catch(() => picked.title);
+    return h1Title || picked.title;
+}
+
+// ====================== MAIN BOT ======================
 async function main() {
-    console.log("🚀 Share eLearning Bot Started...\n");
+    const availableCourses = listAnswerFiles();
+    console.log(`🚀 Share eLearning Bot ${BOT_VERSION}`);
+    console.log(`📂 Running: ${__filename}`);
+    console.log(`📂 CWD: ${process.cwd()}`);
+    console.log(`📚 Answer files for any course: ${availableCourses.join(', ') || '(none)'}\n`);
+    debugLog({
+        hypothesisId: 'H0',
+        location: 'bot.ts:main',
+        message: 'bot started',
+        data: { version: BOT_VERSION, file: __filename, cwd: process.cwd(), availableCourses },
+    });
 
     const students: any[] = [];
     fs.createReadStream('data.csv')
@@ -61,7 +661,7 @@ async function main() {
         .on('end', async () => {
             for (const student of students) {
                 await processStudent(student);
-                await new Promise(r => setTimeout(r, 12000));
+                await new Promise(r => setTimeout(r, 15000));
             }
         });
 }
@@ -74,7 +674,7 @@ async function processStudent(student: any) {
 
     console.log(`\n👤 Processing: ${student.firstname || ''} ${student.lastname || ''} (${username})`);
 
-    const browser = await chromium.launch({ headless: false, slowMo: 700 });
+    const browser = await chromium.launch({ headless: false, slowMo: 150 });
     const page = await browser.newPage();
 
     try {
@@ -87,15 +687,10 @@ async function processStudent(student: any) {
         await page.goto('https://learn.share.com.et/my/courses.php', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(8000);
 
-        const viewBtn = page.locator('button:has-text("View Course"), a:has-text("View Course")').first();
-        await viewBtn.click({ force: true }).catch(() => {});
-
-        await page.waitForTimeout(10000);
-
-        const courseTitle = await page.locator('h1').first().innerText().catch(() => 'Unknown');
+        const courseTitle = await openCourseFromGrid(page, student);
         console.log(`📘 Course: ${courseTitle}`);
 
-        const answers = loadAnswers(courseTitle);
+        const answers = await loadAnswers(courseTitle);
         await startCourseProgress(page, answers);
 
     } catch (e: any) {
@@ -105,67 +700,130 @@ async function processStudent(student: any) {
     }
 }
 
+async function handleMidCourseQuiz(page: any, answers: string[], answerIndex: number): Promise<number> {
+    let idx = answerIndex;
+    let answered = 0;
+
+    for (let step = 0; step < 5; step++) {
+        const frame = getScormContentFrame(page);
+        if (!frame || !(await isQuizScreen(frame))) break;
+
+        const answer = answers[idx] ?? answers[idx % Math.max(answers.length, 1)] ?? 'ለ';
+        const ok = await clickAnswerByLetter(frame, answer);
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H4',
+            location: 'bot.ts:handleMidCourseQuiz',
+            message: 'mid-course quiz answer',
+            data: { step, qIndex: idx + 1, answer, ok, frameUrl: frame.url() },
+        });
+        // #endregion
+
+        if (!ok) break;
+
+        console.log(`  📝 Quiz Q${idx + 1} → ${answer} ✓`);
+        idx++;
+        answered++;
+        await page.waitForTimeout(1200);
+        await clickQuizNext(frame);
+        await page.waitForTimeout(1500);
+    }
+
+    if (answered > 0) {
+        console.log(`✅ Mid-course quiz: ${answered} question(s) answered`);
+        await waitAndClickContinue(page);
+        await page.waitForTimeout(CONTINUE_POST_CLICK_MS);
+    }
+
+    return idx;
+}
+
 async function startCourseProgress(page: any, answers: string[] = []) {
     let loop = 0;
+    let answerIndex = 0;
 
-    while (loop < 100) {
+    while (loop < 120) {
         loop++;
-        await page.waitForTimeout(4500);
+        if (loop > 1) await page.waitForTimeout(400);
 
-        console.log(`🔄 Loop ${loop} - Searching for መማር ይቀጥሉ...`);
+        const frameCount = page.frames().length;
+        const pageUrl = page.url();
+        const scorm = getScormContentFrame(page);
+        const quizStats = scorm ? await getQuizStats(scorm) : null;
+        const quizActive = quizStats ? isMidQuizOptions(quizStats.optionCount) && quizStats.hasNext : false;
 
-        // Multiple selectors for both types of buttons
-        const selectors = [
-            'button:has-text("መማር ይቀጥሉ")',
-            'text=መማር ይቀጥሉ',
-            'button[style*="rgb(0, 166, 81)"]',
-            'div[style*="background-color"] button:has-text("መማር ይቀጥሉ")',
-            '*:has-text("መማር ይቀጥሉ") >> button',
-            '.btn-success'
-        ];
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H2',
+            location: 'bot.ts:startCourseProgress',
+            message: 'loop start',
+            data: { loop, frameCount, pageUrl, answersCount: answers.length, answerIndex, quizActive, quizStats },
+        });
+        // #endregion
 
-        let clicked = false;
-
-        for (const sel of selectors) {
-            try {
-                const btns = page.locator(sel);
-                const count = await btns.count();
-
-                for (let i = 0; i < count; i++) {
-                    const btn = btns.nth(i);
-                    if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-                        console.log(`✅ Clicking button: ${sel}`);
-                        await btn.scrollIntoViewIfNeeded();
-                        await btn.click({ timeout: 12000, force: true });
-                        clicked = true;
-                        await page.waitForTimeout(7000);
-                        break;
-                    }
-                }
-                if (clicked) break;
-            } catch (e) {}
+        if (await page.locator('text=Your content is loading').isVisible({ timeout: 1000 }).catch(() => false)) {
+            console.log("⏳ Waiting for content to load...");
+            await page.waitForTimeout(5000);
         }
 
-        if (!clicked) {
-            console.log("⚠️ No መማር ይቀጥሉ button found");
+        if (quizActive) {
+            console.log(`🔄 Loop ${loop} - Mid-course quiz detected...`);
+            const before = answerIndex;
+            answerIndex = await handleMidCourseQuiz(page, answers, answerIndex);
+            if (answerIndex > before) continue;
+        }
+
+        console.log(`🔄 Loop ${loop} - Waiting for መማር ይቀጥሉ (${frameCount} frames)...`);
+        const continueResult = await waitAndClickContinue(page);
+        // #region agent log
+        debugLog({ hypothesisId: 'H2', location: 'bot.ts:continueClick', message: 'continue click attempt', data: { loop, ...continueResult } });
+        // #endregion
+
+        if (continueResult.clicked) {
+            console.log(`✅ Clicked መማር ይቀጥሉ via ${continueResult.method} (${continueResult.frameUrl})`);
+            await page.waitForTimeout(CONTINUE_POST_CLICK_MS);
+            await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+        } else {
+            const scorm2 = getScormContentFrame(page);
+            const stats2 = scorm2 ? await getQuizStats(scorm2) : null;
+            // #region agent log
+            debugLog({ hypothesisId: 'H4', location: 'bot.ts:noContinue', message: 'continue missing', data: { loop, stats2 } });
+            // #endregion
+
+            if (scorm2 && stats2 && isMidQuizOptions(stats2.optionCount)) {
+                console.log(`🔄 Loop ${loop} - Quiz screen (${stats2.optionCount} options)...`);
+                answerIndex = await handleMidCourseQuiz(page, answers, answerIndex);
+                continue;
+            }
+
+            console.log("⚠️ Continue not found — checking for FINAL exam start button...");
+            const examResult = await clickTextInFrames(page, ['ፈተናውን ይጀምሩ'], { examMode: true });
+            // #region agent log
+            debugLog({ hypothesisId: 'H3', location: 'bot.ts:examCheck', message: 'final exam click', data: { loop, ...examResult } });
+            // #endregion
+
+            if (examResult.clicked) {
+                await page.waitForTimeout(8000);
+                const scorm3 = getScormContentFrame(page);
+                const stats3 = scorm3 ? await getQuizStats(scorm3) : null;
+                debugLog({ hypothesisId: 'H3', location: 'bot.ts:postExamStart', message: 'quiz stats after exam start', data: { stats3 } });
+
+                if (stats3 && isFinalQuizOptions(stats3.optionCount)) {
+                    console.log(`📝 FINAL exam (${stats3.optionCount} options visible)`);
+                    await takeQuiz(page, answers, { maxQuestions: 14, startIndex: answerIndex, label: 'Final exam' });
+                    break;
+                }
+                if (stats3 && isMidQuizOptions(stats3.optionCount)) {
+                    console.log(`📝 Mid-quiz after exam-like screen (${stats3.optionCount} options)`);
+                    answerIndex = await handleMidCourseQuiz(page, answers, answerIndex);
+                    continue;
+                }
+            }
             await page.screenshot({ path: `debug-no-btn-${loop}.png` }).catch(() => {});
         }
 
-        await autoSkipVideo(page);
-
-        // Check for Exam Start
-        const examBtn = page.locator('text=ፈተናውን ይጀምሩ, button:has-text("ፈተና")').first();
-        if (await examBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log("📝 Starting Final Exam...");
-            await examBtn.click();
-            await page.waitForTimeout(6000);
-            await takeQuiz(page, answers);
-            break;
-        }
-
-        // Check if finished
         if (await page.locator('text=እንኳን ደስ, Completed, አልቋል').count() > 0) {
-            console.log("🎉 Course Completed Successfully!");
+            console.log("🎉 Course Completed!");
             break;
         }
     }
@@ -181,21 +839,52 @@ async function autoSkipVideo(page: any) {
     });
 }
 
-async function takeQuiz(page: any, answers: string[]) {
-    console.log("🧠 Taking 3-question test...");
-    for (let q = 0; q < 3; q++) {
-        await page.waitForTimeout(4000);
-        const answer = answers[q] || 'ለ';
-        console.log(`Q${q+1} → ${answer}`);
+async function takeQuiz(
+    page: any,
+    answers: string[],
+    opts: { maxQuestions: number; startIndex: number; label: string } = { maxQuestions: 14, startIndex: 0, label: 'Final exam' }
+) {
+    console.log(`🧠 ${opts.label} — up to ${opts.maxQuestions} questions (${answers.length} answers in CSV)...`);
+    let idx = opts.startIndex;
+    let failStreak = 0;
 
-        const options = page.locator('label, input[type="radio"]');
-        const idx = ['ለ','ሀ','A'].includes(answer) ? 0 : 
-                    ['ሐ','U','B'].includes(answer) ? 1 : 2;
+    for (let q = 0; q < opts.maxQuestions; q++) {
+        await page.waitForTimeout(3000);
+        const frame = getScormContentFrame(page);
+        if (!frame || !(await isQuizScreen(frame))) {
+            failStreak++;
+            if (failStreak >= 3) {
+                console.log(`⚠️ No quiz UI after Q${q} — stopping ${opts.label}`);
+                break;
+            }
+            await page.waitForTimeout(2000);
+            continue;
+        }
+        failStreak = 0;
 
-        await options.nth(idx).click().catch(() => options.first().click());
-        await page.click('text=ቀጣይ, button:has-text("Submit"), button:has-text("Next")').catch(() => {});
+        const stats = await getQuizStats(frame);
+        const answer = answers[idx] ?? answers[idx % Math.max(answers.length, 1)] ?? 'ለ';
+        const ok = await clickAnswerByLetter(frame, answer);
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H3',
+            location: 'bot.ts:takeQuiz',
+            message: 'final exam answer',
+            data: { q: q + 1, answerIndex: idx, answer, ok, frameUrl: frame.url(), stats },
+        });
+        // #endregion
+
+        console.log(`  Q${q + 1} → ${answer} ${ok ? '✓' : '✗'}`);
+        if (!ok) break;
+
+        idx++;
+        await page.waitForTimeout(2500);
+        await clickQuizNext(frame);
+        await page.waitForTimeout(3500);
     }
-    console.log("✅ Test Completed!");
+
+    await waitAndClickContinue(page);
+    console.log(`✅ ${opts.label} completed`);
 }
 
 main().catch(console.error);

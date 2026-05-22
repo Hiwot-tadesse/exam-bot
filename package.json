@@ -1,5 +1,9 @@
 {
   "type": "module",
+  "scripts": {
+    "start": "tsx bot.ts",
+    "bot": "tsx bot.ts"
+  },
   "dependencies": {
     "csv-parser": "^3.2.1",
     "playwright": "^1.60.0",
@@ -7,6 +11,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.7.0",
-    "@types/xlsx": "^0.0.35"
+    "@types/xlsx": "^0.0.35",
+    "tsx": "^4.19.0"
   }
 }
