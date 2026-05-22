@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const BOT_VERSION = 'v9-view-course-btn';
+const BOT_VERSION = 'v14-login-progress';
 const CONTINUE_POLL_MS = 350;
 const CONTINUE_POST_CLICK_MS = 1500;
 const CHAPTER_QUIZ_MAX_Q = 6;
@@ -14,7 +14,11 @@ const DEBUG_LOG = path.join(__dirname, 'debug-93bca3.log');
 
 function debugLog(payload: Record<string, unknown>) {
     const line = JSON.stringify({ sessionId: '93bca3', timestamp: Date.now(), ...payload }) + '\n';
-    for (const logPath of [DEBUG_LOG, path.join(process.cwd(), 'debug-93bca3.log')]) {
+    for (const logPath of [
+        DEBUG_LOG,
+        path.join(process.cwd(), 'debug-93bca3.log'),
+        path.join(__dirname, '.cursor', 'debug-93bca3.log'),
+    ]) {
         try { fs.appendFileSync(logPath, line); } catch {}
     }
     fetch('http://127.0.0.1:7785/ingest/033e1045-1a8d-439a-aec7-78fd76285c5f', {
@@ -260,6 +264,12 @@ async function isQuizScreen(frame: any): Promise<boolean> {
     return detectQuizScreen(frame);
 }
 
+async function isQuizActive(page: any): Promise<boolean> {
+    const frame = getScormContentFrame(page);
+    if (!frame) return false;
+    return await isQuizScreen(frame);
+}
+
 async function clickAnswerByLetter(frame: any, answer: string): Promise<boolean> {
     const letter = answer.trim().replace(/\s+/g, '');
     if (!letter) return false;
@@ -379,7 +389,7 @@ async function selectQuizAnswer(frame: any, answer: string): Promise<boolean> {
 
 async function clickNextBekuty(page: any): Promise<boolean> {
     for (const frame of sortFramesByContent(page.frames())) {
-        for (const label of ['ቀጣይ', 'Next']) {
+        for (const label of ['ይቀጥሉ', 'ቀጣይ', 'Next']) {
             try {
                 const exact = frame.getByRole('button', { name: label, exact: true });
                 if (await exact.isVisible({ timeout: 500 })) {
@@ -398,7 +408,7 @@ async function clickNextBekuty(page: any): Promise<boolean> {
             } catch {}
         }
     }
-    const result = await clickTextInFrames(page, ['ቀጣይ', 'Next'], { examMode: true });
+    const result = await clickTextInFrames(page, ['ይቀጥሉ', 'ቀጣይ', 'Next'], { examMode: true });
     if (result.clicked) {
         debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next via frames', data: result });
         return true;
@@ -479,12 +489,12 @@ async function findBestClickTarget(frame: any, text: string, opts?: ClickOpts) {
             let best: { x: number; y: number; tag: string; sample: string; area: number } | null = null;
             for (const el of nodes) {
                 const tag = el.tagName;
-                if ((examMode || continueMode) && !['BUTTON', 'A', 'INPUT'].includes(tag)) continue;
+                if (continueMode && !['BUTTON', 'A', 'INPUT'].includes(tag)) continue;
 
                 const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
                 if (examMode) {
-                    if (t !== searchText && !t.endsWith(searchText)) continue;
-                    if (t.length > searchText.length + 8) continue;
+                    if (!t.includes(searchText)) continue;
+                    if (t.length > searchText.length + 12) continue;
                 } else if (!t.includes(searchText)) {
                     continue;
                 }
@@ -523,10 +533,14 @@ async function clickTargetInFrame(frame: any, target: { x: number; y: number; ta
 }
 
 async function clickGreenStyledButton(page: any, textHint: string): Promise<{ clicked: boolean; frameUrl: string; method: string }> {
-    for (const frame of sortFramesByContent(page.frames())) {
+    for (const frame of orderFramesForScorm(page)) {
         const selectors = [
+            `*:has-text("${textHint}")`,
+            `a:has-text("${textHint}")`,
+            `span:has-text("${textHint}")`,
             `button[style*="rgb(0, 166, 81)"]:has-text("${textHint}")`,
             `button[style*="0, 166, 81)"]:has-text("${textHint}")`,
+            '[style*="rgb(0, 166, 81)"]',
             'button[style*="rgb(0, 166, 81)"]',
         ];
         for (const sel of selectors) {
@@ -552,7 +566,7 @@ async function clickTextInFrames(
         debugLog({ hypothesisId: opts?.examMode ? 'H3' : 'H2', location: 'bot.ts:scanTextInFrames', message: 'frame scan', data: { text, examMode: !!opts?.examMode, scan } });
         // #endregion
 
-        if (!opts?.examMode) {
+        if (!opts?.examMode || /ፈተና/.test(text)) {
             const green = await clickGreenStyledButton(page, text.slice(0, 8));
             if (green.clicked) {
                 return { clicked: true, frameUrl: green.frameUrl, matchedText: text, method: green.method };
@@ -567,7 +581,7 @@ async function clickTextInFrames(
                 await clickTargetInFrame(frame, target);
                 return { clicked: true, frameUrl, matchedText: text, method: `mouse:${target.tag}` };
             } catch {
-                if (!opts?.examMode && !opts?.continueMode) {
+                if (!opts?.continueMode) {
                     try {
                         await frame.evaluate((searchText) => {
                             const collect = (root: Document | ShadowRoot, out: Element[]) => {
@@ -629,34 +643,123 @@ async function clickTextInFrames(
     return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'none' };
 }
 
+/** Click መማር ይቀጥሉ only inside SCORM lesson frames (not Moodle sidebar). */
 async function waitAndClickContinue(page: any): Promise<{ clicked: boolean; frameUrl: string; matchedText: string; method: string }> {
-    const maxAttempts = 40;
-    const t0 = Date.now();
+    if (await quizScreenActive(page)) {
+        return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'quiz-active' };
+    }
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        if (attempt > 0) await safePageWait(page, CONTINUE_POLL_MS);
+    await autoSkipVideo(page);
 
-        if (await quizScreenActive(page)) {
-            continue;
-        }
+    const lessonFrames = orderFramesForScorm(page).filter(
+        (f: any) => /scormcontent|player\.php/i.test(f.url())
+    );
 
-        await autoSkipVideo(page);
-
-        const result = await clickTextInFrames(page, ['መማር ይቀጥሉ'], { continueMode: true });
-        if (result.clicked) {
-            // #region agent log
-            debugLog({
-                hypothesisId: 'H2',
-                location: 'bot.ts:waitAndClickContinue',
-                message: 'continue clicked',
-                data: { attempt, elapsedMs: Date.now() - t0, ...result },
+    for (const frame of lessonFrames) {
+        const frameUrl = frame.url();
+        const target = await findBestClickTarget(frame, 'መማር ይቀጥሉ', { continueMode: true });
+        if (!target) continue;
+        try {
+            await clickTargetInFrame(frame, target);
+            return { clicked: true, frameUrl, matchedText: 'መማር ይቀጥሉ', method: `lesson:${target.tag}` };
+        } catch {}
+        try {
+            const ok = await frame.evaluate(() => {
+                const needles = ['መማር ይቀጥሉ'];
+                const nodes = [...document.querySelectorAll('button, a, span, p, div')];
+                let best: HTMLElement | null = null;
+                let bestArea = Infinity;
+                for (const el of nodes) {
+                    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!needles.some((n) => t.includes(n)) || t.length > 40) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 20 || rect.height < 8) continue;
+                    const area = rect.width * rect.height;
+                    if (area < bestArea) {
+                        best = el as HTMLElement;
+                        bestArea = area;
+                    }
+                }
+                if (!best) return false;
+                best.scrollIntoView({ block: 'center' });
+                best.click();
+                return true;
             });
-            // #endregion
-            return result;
-        }
+            if (ok) return { clicked: true, frameUrl, matchedText: 'መማር ይቀጥሉ', method: 'lesson:evaluate' };
+        } catch {}
     }
 
     return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'none' };
+}
+
+// ====================== LOGIN ======================
+async function isLoggedIn(page: any): Promise<boolean> {
+    if (/login\/index\.php|login\.php\?/i.test(page.url())) return false;
+    try {
+        const courseBtns = await page.locator('a.view-course-btn').count();
+        if (courseBtns > 0) return true;
+    } catch {}
+    try {
+        const loginForm = await page.locator('form#login input[name="username"]').isVisible({ timeout: 800 });
+        const welcome = await page.getByText(/Enter your details to log in/i).isVisible({ timeout: 800 }).catch(() => false);
+        if (loginForm && welcome) return false;
+    } catch {}
+    return !/login\/index/i.test(page.url());
+}
+
+async function loginStudent(page: any, username: string, password: string): Promise<void> {
+    console.log(`🔐 Logging in as ${username}...`);
+    await page.goto('https://learn.share.com.et/login/index.php', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('input[name="username"]', { state: 'visible', timeout: 20000 });
+    await page.fill('input[name="username"]', username);
+    await page.fill('input[name="password"]', password);
+    await page.click('button[type="submit"], #loginbtn, input[type="submit"]', { timeout: 15000 });
+    await safePageWait(page, 4000);
+    try {
+        await page.waitForFunction(
+            () => !/login\/index\.php/i.test(window.location.href),
+            { timeout: 45000 }
+        );
+    } catch {
+        /* check URL below */
+    }
+}
+
+async function ensureLoggedIn(page: any, username: string, password: string): Promise<void> {
+    await loginStudent(page, username, password);
+
+    if (/login\/index\.php/i.test(page.url())) {
+        const errMsg = await page
+            .locator('.alert-danger, .loginerrors, #loginerrormessage, .invalid-feedback')
+            .first()
+            .innerText()
+            .catch(() => '');
+        throw new Error(
+            `Login failed for ${username}${errMsg ? ` — ${errMsg.trim()}` : ' — still on login page (check password in data.csv)'}`
+        );
+    }
+
+    await goToMyCourses(page);
+
+    const courseCount = await page.locator('a.view-course-btn').count().catch(() => 0);
+    if (courseCount === 0 && /login/i.test(page.url())) {
+        throw new Error(`Login failed for ${username} — My courses redirected to login`);
+    }
+    if (courseCount === 0) {
+        throw new Error(`Logged in but no View Course buttons found on My courses`);
+    }
+    console.log(`✅ Logged in (${courseCount} courses on grid)`);
+}
+
+function isValidCourseCard(c: CourseCardInfo): boolean {
+    if (!c.courseId || !/^\d+$/.test(c.courseId)) return false;
+    if (!c.href || !/course\/view\.php\?id=\d+/i.test(c.href)) return false;
+    const t = c.title;
+    if (t.length > 150 || t.length < 8) return false;
+    if (/welcome to share|enter your details|username|password|skip to main|cdata|jsenabled|forgot your password|log in english/i.test(t)) {
+        return false;
+    }
+    return /[\u1200-\u137F]{2,}/.test(t) && /\([A-Za-z][^)]{2,80}\)/.test(t);
 }
 
 // ====================== COURSE PICKER (My courses grid) ======================
@@ -707,7 +810,15 @@ async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
             node = start?.parentElement ?? null;
             for (let depth = 0; depth < 8 && node; depth++) {
                 const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-                if (text.includes('(') && text.includes(')') && text.length > 35 && text.length < 900) return text;
+                if (
+                    /%\s*Course completed/i.test(text) &&
+                    /[\u1200-\u137F]{2,}/.test(text) &&
+                    /\([A-Za-z][^)]{2,80}\)/.test(text) &&
+                    text.length > 35 &&
+                    text.length < 900
+                ) {
+                    return text;
+                }
                 node = node.parentElement;
             }
             return '';
@@ -733,9 +844,12 @@ async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
                 }
             }
             if (!title || title.length < 5) title = titleFallback;
+            if (!courseId || !/course\/view\.php/i.test(href)) return;
+            if (/welcome to share|username|password|skip to main|cdata|jsenabled/i.test(cardText)) return;
+            if (!/[\u1200-\u137F]{2,}/.test(title) || !/\([A-Za-z][^)]{2,80}\)/.test(title)) return;
             const pctMatch = cardText.match(/(\d+)%\s*Course completed/i);
             const percent = pctMatch ? parseInt(pctMatch[1], 10) : 0;
-            const completed = percent >= 100;
+            const completed = percent >= 100 || /100%\s*Course completed/i.test(cardText);
             results.push({
                 title,
                 percent,
@@ -748,12 +862,24 @@ async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
         };
 
         const titleFromCard = (btn: Element): string => {
-            const card = btn.closest('.card, article, [class*="course-card"], [class*="dashboard-card"], div');
+            const card = btn.closest('.card, article, [class*="course-card"], [class*="dashboard-card"], .col');
             if (!card) return '';
-            for (const sel of ['h3', 'h4', 'h5', '[class*="coursename"]', '[class*="course-title"]', 'a[href*="course/view"]']) {
-                const el = card.querySelector(sel);
-                const t = (el?.textContent || '').replace(/\s+/g, ' ').trim();
-                if (t && /\(.+\)/.test(t) && t.length > 12 && t.length < 200) return t;
+            const nameLink = card.querySelector(
+                'a[href*="course/view.php"]:not(.view-course-btn), .coursename a, h3 a, h4 a'
+            ) as HTMLAnchorElement | null;
+            if (nameLink) {
+                const t = (nameLink.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t.length > 8 && t.length < 220) return t;
+            }
+            const blob = (card.textContent || '').replace(/\s+/g, ' ').trim();
+            const matches = [...blob.matchAll(/([\u1200-\u137F][\u1200-\u137F\s]{3,}?)\s*\(([^)]+)\)/g)];
+            if (matches.length) {
+                const last = matches[matches.length - 1];
+                return `${last[1].trim()} (${last[2].trim()})`;
+            }
+            for (const sel of ['h3', 'h4', 'h5', '.coursename', '[class*="course-title"]']) {
+                const t = (card.querySelector(sel)?.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t && /\(.+\)/.test(t) && t.length > 12 && t.length < 220) return t;
             }
             return '';
         };
@@ -787,14 +913,6 @@ async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
             });
         }
 
-        if (!results.length) {
-            document.querySelectorAll('[class*="course"], [data-region="course-content"], .card, article').forEach((el, i) => {
-                const cardText = (el.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!/%\s*Course completed/i.test(cardText) && !/\(\s*[A-Za-z]/.test(cardText)) return;
-                pushCard(cardText, `Course ${i + 1}`, i, '', '');
-            });
-        }
-
         return results;
     });
 }
@@ -823,8 +941,8 @@ async function waitForCoursesGrid(page: any): Promise<CourseCardInfo[]> {
         }).catch(() => {});
         await safePageWait(page, 800);
 
-        const cards = await listCoursesOnPage(page);
-        // #region agent log
+        const raw = await listCoursesOnPage(page);
+        const cards = raw.filter(isValidCourseCard);
         debugLog({
             hypothesisId: 'H2',
             runId: 'pre-fix',
@@ -832,14 +950,16 @@ async function waitForCoursesGrid(page: any): Promise<CourseCardInfo[]> {
             message: 'grid poll',
             data: {
                 attempt,
+                rawCount: raw.length,
                 cardCount: cards.length,
                 pageUrl: page.url(),
-                uniqueTitles: [...new Set(cards.map((c: CourseCardInfo) => c.title))].length,
-                titles: cards.map((c: CourseCardInfo) => ({ title: c.title, percent: c.percent, buttonIndex: c.buttonIndex })),
+                titles: cards.map((c: CourseCardInfo) => ({ title: c.title, percent: c.percent, courseId: c.courseId })),
             },
         });
-        // #endregion
         if (cards.length) return cards;
+        if (/login\/index/i.test(page.url())) {
+            throw new Error('Not logged in — on login page instead of My courses');
+        }
     }
 
     return [];
@@ -859,9 +979,15 @@ function pickRandomCourseCard(
     usedIndices: Set<number>,
     studentOrdinal: number
 ): CourseCardInfo {
-    const named = cards.filter((c) => !/^Course \d+$/i.test(c.title.trim()));
+    const withLink = cards.filter(
+        (c) => c.courseId && c.href && !/^Course \d+$/i.test(c.title.trim())
+    );
+    const named = withLink;
     const incomplete = named.filter((c) => !c.completed && c.percent < 100);
-    const pool = incomplete.length ? incomplete : (named.length ? named : cards);
+    if (!incomplete.length) {
+        throw new Error(`All courses are 100% complete for this user — nothing to do`);
+    }
+    const pool = incomplete;
 
     let available = pool.filter((c) => !usedIndices.has(c.index));
     if (!available.length && pool.length > 1) {
@@ -881,12 +1007,134 @@ function pickRandomCourseCard(
     return picked;
 }
 
+/** True when we left My courses and opened a course or SCORM shell. */
+function isCourseOpenedUrl(url: string): boolean {
+    if (/my\/courses\.php/i.test(url)) return false;
+    return /course\/view\.php|mod\/scorm\/view\.php|mod\/scorm\/player\.php/i.test(url);
+}
+
+async function waitForOpenedCourse(page: any, timeoutMs = 45000): Promise<boolean> {
+    try {
+        await page.waitForFunction(() => {
+            const h = window.location.href;
+            if (/my\/courses\.php/i.test(h)) return false;
+            return /course\/view\.php|mod\/scorm/i.test(h);
+        }, { timeout: timeoutMs });
+        return isCourseOpenedUrl(page.url());
+    } catch {
+        return isCourseOpenedUrl(page.url());
+    }
+}
+
+async function goToMyCourses(page: any): Promise<void> {
+    await page.goto('https://learn.share.com.et/my/courses.php', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+    });
+    await safePageWait(page, 4000);
+    await page.locator('a.view-course-btn').first().waitFor({ state: 'visible', timeout: 25000 }).catch(() => {});
+}
+
+/** Navigate without waiting for commit (Moodle often never fires it). */
+async function navigateToCourseUrl(page: any, fullHref: string): Promise<boolean> {
+    if (isCourseOpenedUrl(page.url())) return true;
+
+    await page.evaluate((u: string) => window.location.assign(u), fullHref).catch(() => {});
+    if (await waitForOpenedCourse(page, 35000)) return true;
+
+    try {
+        await page.goto(fullHref, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    } catch {
+        /* partial load may still have navigated */
+    }
+    await safePageWait(page, 2000);
+    return isCourseOpenedUrl(page.url());
+}
+
+/** Click View Course on My courses, then enter the lesson via መማር ይቀጥሉ (not direct SCORM link). */
+async function clickViewCourseButton(page: any, picked: CourseCardInfo): Promise<boolean> {
+    const urlBefore = page.url();
+    const fullHref = picked.href.startsWith('http')
+        ? picked.href
+        : `https://learn.share.com.et${picked.href}`;
+
+    console.log(`🔗 View Course: ${picked.title}`);
+
+    let method = 'dom-click';
+    const clickedInDom = await page.evaluate(
+        ({ courseId, buttonIndex }: { courseId: string; buttonIndex: number }) => {
+            const buttons = [
+                ...document.querySelectorAll('a.view-course-btn, a[title="View Course"]'),
+            ].filter((el) => /view course/i.test((el.textContent || '').trim()) || (el as HTMLAnchorElement).href?.includes('course/view'));
+            let btn: HTMLAnchorElement | null = null;
+            if (courseId) {
+                btn = buttons.find((b) => (b as HTMLAnchorElement).href?.includes(`id=${courseId}`)) as HTMLAnchorElement | null;
+            }
+            if (!btn && buttons[buttonIndex]) btn = buttons[buttonIndex] as HTMLAnchorElement;
+            if (!btn) return false;
+            btn.scrollIntoView({ block: 'center', inline: 'center' });
+            btn.click();
+            return true;
+        },
+        { courseId: picked.courseId, buttonIndex: picked.buttonIndex }
+    ).catch(() => false);
+
+    if (clickedInDom && (await waitForOpenedCourse(page, 25000))) {
+        debugLog({
+            hypothesisId: 'H1',
+            runId: 'post-fix',
+            location: 'bot.ts:clickViewCourseButton',
+            message: 'opened course',
+            data: { method, urlBefore, pageUrl: page.url(), fullHref, courseId: picked.courseId },
+        });
+        return true;
+    }
+
+    let viewBtn = page.locator(`a.view-course-btn[href*="id=${picked.courseId}"]`).first();
+    if ((await viewBtn.count().catch(() => 0)) === 0) {
+        viewBtn = page.locator('a.view-course-btn').nth(picked.buttonIndex);
+    }
+    await viewBtn.scrollIntoViewIfNeeded({ timeout: 15000 }).catch(() => {});
+
+    method = 'playwright-click';
+    try {
+        await viewBtn.click({ timeout: 12000, noWaitAfter: true });
+        if (await waitForOpenedCourse(page, 25000)) {
+            debugLog({
+                hypothesisId: 'H1',
+                runId: 'post-fix',
+                location: 'bot.ts:clickViewCourseButton',
+                message: 'opened course',
+                data: { method, urlBefore, pageUrl: page.url(), fullHref, courseId: picked.courseId },
+            });
+            return true;
+        }
+    } catch {
+        /* fall through to assign href */
+    }
+
+    method = 'location-assign';
+    let opened = await navigateToCourseUrl(page, fullHref);
+    if (!opened && isCourseOpenedUrl(page.url())) opened = true;
+
+    debugLog({
+        hypothesisId: 'H1',
+        runId: 'post-fix',
+        location: 'bot.ts:clickViewCourseButton',
+        message: 'opened course',
+        data: { method, opened, urlBefore, pageUrl: page.url(), fullHref, courseId: picked.courseId },
+    });
+
+    return opened;
+}
+
 async function openCourseFromGrid(
     page: any,
     student: any,
     usedIndices: Set<number>,
     studentOrdinal: number
 ): Promise<string> {
+    await goToMyCourses(page);
     const cards = await waitForCoursesGrid(page);
 
     // #region agent log
@@ -894,8 +1142,10 @@ async function openCourseFromGrid(
     // #endregion
 
     if (!cards.length) {
-        console.log('⚠️ No courses found on My courses page');
-        return 'Unknown';
+        if (/login\/index/i.test(page.url())) {
+            throw new Error('No courses — still on login page (login did not succeed)');
+        }
+        throw new Error('No valid courses on My courses page (need View Course buttons with course id)');
     }
 
     const preference = (student.course || student.coursename || '').toString().trim();
@@ -930,95 +1180,33 @@ async function openCourseFromGrid(
 
     console.log(`📗 Opening [${picked.index + 1}/${cards.length}]: ${picked.title} (${picked.percent}% done)`);
 
-    const urlBefore = page.url();
-    let viewBtn = picked.courseId
-        ? page.locator(`a.view-course-btn[href*="id=${picked.courseId}"]`).first()
-        : page.locator('a.view-course-btn').nth(picked.buttonIndex);
-    if ((await viewBtn.count().catch(() => 0)) === 0) {
-        viewBtn = page.locator('a:has-text("View Course")').nth(picked.buttonIndex);
-    }
-    const btnHref = picked.href || (await viewBtn.getAttribute('href').catch(() => null));
-    // #region agent log
-    debugLog({
-        hypothesisId: 'H1',
-        runId: 'post-fix',
-        location: 'bot.ts:openCourseFromGrid',
-        message: 'before view course click',
-        data: {
-            courseId: picked.courseId,
-            buttonIndex: picked.buttonIndex,
-            btnHref,
-            title: picked.title,
-            pageUrl: urlBefore,
-        },
-    });
-    // #endregion
-
-    await viewBtn.scrollIntoViewIfNeeded().catch(() => {});
-    await page.evaluate((idx: number) => {
-        const buttons = [...document.querySelectorAll('a.view-course-btn')];
-        const el = buttons[idx] as HTMLElement | undefined;
-        el?.scrollIntoView({ block: 'center', inline: 'center' });
-    }, picked.buttonIndex).catch(() => {});
-    await safePageWait(page, 500);
-
-    let opened = false;
-    try {
-        await Promise.all([
-            page.waitForURL(/course\/view\.php/i, { timeout: 45000, waitUntil: 'commit' }),
-            viewBtn.click({ timeout: 20000 }),
-        ]);
-        opened = /course\/view\.php/i.test(page.url());
-    } catch {
-        await viewBtn.evaluate((el: HTMLAnchorElement) => el.click()).catch(() => {});
-        await page.waitForURL(/course\/view\.php/i, { timeout: 30000, waitUntil: 'commit' }).catch(() => {});
-        opened = /course\/view\.php/i.test(page.url());
+    if (!picked.href || !picked.courseId) {
+        throw new Error(`View Course link missing for "${picked.title}"`);
     }
 
-    if (!opened && btnHref) {
-        const targetUrl = btnHref.startsWith('http') ? btnHref : `https://learn.share.com.et${btnHref}`;
-        await page.goto(targetUrl, { waitUntil: 'commit', timeout: 60000 });
-        opened = /course\/view\.php/i.test(page.url());
-    }
+    const opened = await clickViewCourseButton(page, picked);
+    const onCourse = opened || isCourseOpenedUrl(page.url());
 
-    // #region agent log
     debugLog({
         hypothesisId: 'H1',
         runId: 'post-fix',
         location: 'bot.ts:openCourseFromGrid',
         message: 'after view course click',
         data: {
-            method: 'view-course-btn',
             courseId: picked.courseId,
-            btnHref,
-            urlBefore,
+            href: picked.href,
             pageUrl: page.url(),
-            openedCourseView: opened,
+            opened,
+            onCourse,
         },
     });
-    // #endregion
 
-    if (!opened) {
-        throw new Error(`View Course click did not open course (still on ${page.url()})`);
+    if (!onCourse) {
+        throw new Error(`View Course did not open course (still on ${page.url()})`);
     }
 
-    if (/course\/view\.php/i.test(page.url()) && !/mod\/scorm/i.test(page.url())) {
-        const scormLink = page.locator('a[href*="mod/scorm/view"]').first();
-        if (await scormLink.isVisible({ timeout: 8000 }).catch(() => false)) {
-            await scormLink.click({ force: true, timeout: 15000, noWaitAfter: true });
-            await page.waitForURL(/mod\/scorm/i, { timeout: 60000 }).catch(() => {});
-            // #region agent log
-            debugLog({
-                hypothesisId: 'H1',
-                runId: 'post-fix',
-                location: 'bot.ts:openCourseFromGrid',
-                message: 'entered scorm from course view',
-                data: { pageUrl: page.url() },
-            });
-            // #endregion
-        }
-    }
-    await safePageWait(page, 5000);
+    console.log(`✅ Course page open: ${page.url()}`);
+    await safePageWait(page, 3000);
     const h1Title = await page.locator('h1').first().innerText().catch(() => '');
     if (h1Title && normalizeText(h1Title) !== normalizeText(picked.title)) {
         console.log(`📌 Grid title for answers: "${picked.title}" (page H1: "${h1Title.trim()}")`);
@@ -1067,34 +1255,14 @@ async function processStudent(student: any, usedCourseIndices: Set<number>, stud
     const page = await browser.newPage();
 
     try {
-        const tLogin = Date.now();
-        await page.goto('https://learn.share.com.et/login/index.php', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.fill('input[name="username"]', username);
-        await page.fill('input[name="password"]', student.password || `${username}@R&D`);
-        await page.click('button[type="submit"]', { noWaitAfter: true });
-        await page.waitForURL(/my\/courses|course\/view|dashboard|login\/index/i, { timeout: 45000 }).catch(() => {});
-        // #region agent log
+        const password = (student.password || `${username}@R&D`).toString();
+        await ensureLoggedIn(page, username, password);
         debugLog({
             hypothesisId: 'H3',
-            runId: 'pre-fix',
             location: 'bot.ts:processStudent',
-            message: 'after login click',
-            data: { username, ms: Date.now() - tLogin, pageUrl: page.url() },
+            message: 'logged in',
+            data: { username, pageUrl: page.url() },
         });
-        // #endregion
-
-        const tCourses = Date.now();
-        await page.goto('https://learn.share.com.et/my/courses.php', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        // #region agent log
-        debugLog({
-            hypothesisId: 'H3',
-            runId: 'pre-fix',
-            location: 'bot.ts:processStudent',
-            message: 'after courses goto',
-            data: { username, ms: Date.now() - tCourses, pageUrl: page.url() },
-        });
-        // #endregion
-        await safePageWait(page, 8000);
 
         const courseTitle = await openCourseFromGrid(page, student, usedCourseIndices, studentOrdinal);
         console.log(`📘 Course: ${courseTitle}`);
@@ -1104,163 +1272,446 @@ async function processStudent(student: any, usedCourseIndices: Set<number>, stud
         }
 
         const answers = await loadAnswers(courseTitle);
-        await startCourseProgress(page, answers);
+
+        if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) {
+            console.log('🎉 Course already complete/certified — logout → next user');
+        } else {
+            await runCourseUntilCertified(page, answers);
+        }
 
     } catch (e: any) {
-        console.log(`❌ Error: ${e.message}`);
+        const msg = e.message || String(e);
+        if (/100% complete|already complete|nothing to do/i.test(msg)) {
+            console.log(`ℹ️ ${msg}`);
+        } else {
+            console.log(`❌ Error: ${msg}`);
+        }
     } finally {
+        await logoutUser(page).catch(() => {});
         await browser.close();
     }
 }
 
-async function runChapterQuiz(
+async function logoutUser(page: any): Promise<void> {
+    if (!page || page.isClosed()) return;
+    console.log('🚪 Logging out → next user...');
+    const logoutUrls = [
+        'https://learn.share.com.et/login/logout.php',
+        'https://learn.share.com.et/logout.php',
+    ];
+    for (const url of logoutUrls) {
+        try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+            await safePageWait(page, 2000);
+            if (/login/i.test(page.url())) {
+                console.log('✅ Logged out');
+                return;
+            }
+        } catch {}
+    }
+    try {
+        await page.getByRole('link', { name: /log out|logout|ውጣ/i }).first().click({ timeout: 5000 });
+        await page.waitForURL(/login/i, { timeout: 15000 }).catch(() => {});
+        console.log('✅ Logged out');
+    } catch {
+        console.log('⚠️ Logout link not found — closing browser for next user');
+    }
+}
+
+/** Answer one question: pick letter → ያስገቡ → ይቀጥሉ */
+async function answerOneQuizQuestion(
     page: any,
     answers: string[],
     answerIndex: number,
-    maxQuestions: number = CHAPTER_QUIZ_MAX_Q
+    qNum: number,
+    label: string
+): Promise<{ ok: boolean; nextIndex: number }> {
+    const frame = getScormContentFrame(page);
+    if (!frame || !(await isQuizScreen(frame))) {
+        return { ok: false, nextIndex: answerIndex };
+    }
+
+    const answer = answers[answerIndex] ?? answers[answerIndex % Math.max(answers.length, 1)] ?? 'ለ';
+    const selected = await selectQuizAnswer(frame, answer);
+    if (!selected) return { ok: false, nextIndex: answerIndex };
+
+    console.log(`  📝 ${label} Q${qNum} → ${answer} ✓`);
+    await safePageWait(page, 400);
+    await clickSubmitYasebu(page);
+    await safePageWait(page, 500);
+    await clickNextBekuty(page);
+    await safePageWait(page, 600);
+
+    return { ok: true, nextIndex: answerIndex + 1 };
+}
+
+async function runQuizBlock(
+    page: any,
+    answers: string[],
+    startIndex: number,
+    maxQuestions: number,
+    label: string
 ): Promise<number> {
-    let idx = answerIndex;
+    let idx = startIndex;
     let answered = 0;
 
-    console.log(`📋 Chapter test started (up to ${maxQuestions} questions)...`);
+    console.log(`   ▶️ ${label}: starting to answer up to ${maxQuestions} questions (until quiz ends)`);
 
     for (let q = 0; q < maxQuestions; q++) {
-        await safePageWait(page, 500);
+        await safePageWait(page, 700);
+
         const frame = getScormContentFrame(page);
-        if (!frame || !(await isChapterQuizScreen(frame))) break;
-
-        const answer = answers[idx] ?? answers[idx % Math.max(answers.length, 1)] ?? 'ለ';
-        const selected = await selectQuizAnswer(frame, answer);
-        // #region agent log
-        debugLog({
-            hypothesisId: 'H4',
-            location: 'bot.ts:runChapterQuiz',
-            message: 'chapter quiz answer',
-            data: { q: q + 1, qIndex: idx + 1, answer, selected, frameUrl: frame.url() },
-        });
-        // #endregion
-
-        if (!selected) break;
-
-        console.log(`  📝 Q${q + 1} → ${answer} ✓`);
-        idx++;
-        answered++;
-
-        await safePageWait(page, 400);
-        const submitted = await clickSubmitYasebu(page);
-        // #region agent log
-        debugLog({ hypothesisId: 'H4', location: 'bot.ts:runChapterQuiz', message: 'submit ያስገቡ', data: { q: q + 1, submitted } });
-        // #endregion
-
-        if (!submitted) {
-            console.log('  ⚠️ ያስገቡ not found after answer');
+        if (!frame) {
+            console.log(`   ⏹️ ${label}: no SCORM frame — stopping`);
             break;
         }
-        await safePageWait(page, 600);
-        const nextClicked = await clickNextBekuty(page);
-        debugLog({ hypothesisId: 'H4', location: 'bot.ts:runChapterQuiz', message: 'next ቀጣይ', data: { q: q + 1, nextClicked } });
-        await safePageWait(page, nextClicked ? 700 : 300);
+
+        const stillQuiz = await isQuizScreen(frame);
+        if (!stillQuiz) {
+            console.log(`   ⏹️ ${label}: quiz screen gone — done after ${answered} answered`);
+            break;
+        }
+
+        const result = await answerOneQuizQuestion(page, answers, idx, q + 1, label);
+        if (!result.ok) {
+            console.log(`   ⚠️ ${label}: failed to answer Q${q + 1} — stopping`);
+            break;
+        }
+
+        idx = result.nextIndex;
+        answered++;
+
+        await safePageWait(page, 900);
+
+        const afterFrame = getScormContentFrame(page);
+        if (!afterFrame) break;
+        if (!(await isQuizScreen(afterFrame))) {
+            console.log(`   ✅ ${label}: quiz finished after ${answered} questions`);
+            break;
+        }
     }
 
     if (answered > 0) {
-        console.log(`✅ Chapter test done (${answered} questions) — looking for መማር ይቀጥሉ...`);
-        for (let i = 0; i < 25; i++) {
-            await page.waitForTimeout(CONTINUE_POLL_MS);
-            if (await quizScreenActive(page)) continue;
-            const cont = await waitAndClickContinue(page);
-            if (cont.clicked) {
-                console.log('✅ መማር ይቀጥሉ after chapter test');
-                await page.waitForTimeout(CONTINUE_POST_CLICK_MS);
-                break;
-            }
-        }
+        console.log(`✅ ${label} completed: ${answered} questions answered`);
+    } else {
+        console.log(`⚠️ ${label}: no questions were answered`);
     }
-
     return idx;
 }
 
-async function startCourseProgress(page: any, answers: string[] = []) {
+/** Open SCORM player from view.php (Moodle shell → actual lesson iframe). */
+async function enterScormPlayer(page: any): Promise<boolean> {
+    if (/mod\/scorm\/player\.php/i.test(page.url())) return true;
+
+    const idMatch = page.url().match(/[?&]id=(\d+)/);
+    if (idMatch) {
+        const playerUrl = page.url().replace(/view\.php/, 'player.php');
+        try {
+            await page.goto(playerUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await safePageWait(page, 3000);
+            if (/player\.php/i.test(page.url())) {
+                console.log('📦 Entered SCORM player');
+                return true;
+            }
+        } catch {}
+    }
+
+    try {
+        const clicked = await page.evaluate(() => {
+            const link = [...document.querySelectorAll('a[href*="player.php"]')].find((a) =>
+                (a as HTMLAnchorElement).href?.includes('mod/scorm/player')
+            ) as HTMLAnchorElement | undefined;
+            if (link) {
+                link.click();
+                return true;
+            }
+            return false;
+        });
+        if (clicked) {
+            await page.waitForURL(/player\.php/i, { timeout: 20000 }).catch(() => {});
+            return /player\.php/i.test(page.url());
+        }
+    } catch {}
+
+    return /player\.php/i.test(page.url());
+}
+
+async function isCourseAlreadyComplete(page: any): Promise<boolean> {
+    if (await isCourseCertified(page)) return true;
+    for (const frame of page.frames()) {
+        try {
+            const done = await frame.evaluate(() => {
+                const t = (document.body?.innerText || '').replace(/\s+/g, ' ');
+                return /100%\s*Course completed|100%\s*አጠናቅቋል|Course completed/i.test(t)
+                    && !/0%\s*Course completed/i.test(t);
+            });
+            if (done) return true;
+        } catch {}
+    }
+    return false;
+}
+
+/** Steps 3–8: start with መማር ይቀጥሉ, skip videos, quizzes, exams, until certified. */
+async function runCourseUntilCertified(page: any, answers: string[] = []) {
     let loop = 0;
     let answerIndex = 0;
+    let continueStreak = 0;
+    let lastContinueSig = '';
 
-    while (loop < 120) {
+    await enterScormPlayer(page);
+
+    console.log('▶️ Step 3: Start lesson (መማር ይቀጥሉ inside SCORM if visible)...');
+    const startCont = await waitAndClickContinue(page);
+    if (startCont.clicked) {
+        console.log(`✅ Started lesson via ${startCont.method}`);
+        await safePageWait(page, CONTINUE_POST_CLICK_MS);
+    }
+
+    while (loop < 150) {
         loop++;
-        if (loop > 1) await page.waitForTimeout(400);
+        await safePageWait(page, 400);
 
-        const frameCount = page.frames().length;
-        const pageUrl = page.url();
-        const scorm = getScormContentFrame(page);
-        const quizStats = scorm ? await getQuizStats(scorm) : null;
-        const quizActive = scorm ? await isChapterQuizScreen(scorm) : false;
-
-        // #region agent log
-        debugLog({
-            hypothesisId: 'H2',
-            location: 'bot.ts:startCourseProgress',
-            message: 'loop start',
-            data: { loop, frameCount, pageUrl, answersCount: answers.length, answerIndex, quizActive, quizStats },
-        });
-        // #endregion
-
-        if (await page.locator('text=Your content is loading').isVisible({ timeout: 1000 }).catch(() => false)) {
-            console.log("⏳ Waiting for content to load...");
-            await page.waitForTimeout(5000);
-        }
-
-        if (quizActive) {
-            console.log(`🔄 Loop ${loop} - Chapter quiz detected...`);
-            const before = answerIndex;
-            answerIndex = await runChapterQuiz(page, answers, answerIndex);
-            if (answerIndex > before) continue;
-        }
-
-        console.log(`🔄 Loop ${loop} - Waiting for መማር ይቀጥሉ (${frameCount} frames)...`);
-        const continueResult = await waitAndClickContinue(page);
-        // #region agent log
-        debugLog({ hypothesisId: 'H2', location: 'bot.ts:continueClick', message: 'continue click attempt', data: { loop, ...continueResult } });
-        // #endregion
-
-        if (continueResult.clicked) {
-            console.log(`✅ Clicked መማር ይቀጥሉ via ${continueResult.method} (${continueResult.frameUrl})`);
-            await page.waitForTimeout(CONTINUE_POST_CLICK_MS);
-            await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
-        } else {
-            const scorm2 = getScormContentFrame(page);
-            const stats2 = scorm2 ? await getQuizStats(scorm2) : null;
-            // #region agent log
-            debugLog({ hypothesisId: 'H4', location: 'bot.ts:noContinue', message: 'continue missing', data: { loop, stats2 } });
-            // #endregion
-
-            if (scorm2 && (await isChapterQuizScreen(scorm2))) {
-                console.log(`🔄 Loop ${loop} - Chapter quiz (${stats2?.optionCount ?? '?'} options)...`);
-                answerIndex = await runChapterQuiz(page, answers, answerIndex);
-                continue;
-            }
-
-            console.log("⚠️ Continue not found — checking for FINAL exam start button...");
-            const examResult = await clickTextInFrames(page, ['ፈተናውን ይጀምሩ'], { examMode: true });
-            // #region agent log
-            debugLog({ hypothesisId: 'H3', location: 'bot.ts:examCheck', message: 'final exam click', data: { loop, ...examResult } });
-            // #endregion
-
-            if (examResult.clicked) {
-                await page.waitForTimeout(8000);
-                const scorm3 = getScormContentFrame(page);
-                const stats3 = scorm3 ? await getQuizStats(scorm3) : null;
-                debugLog({ hypothesisId: 'H3', location: 'bot.ts:postExamStart', message: 'quiz stats after exam start', data: { stats3 } });
-
-                console.log('📝 FINAL exam (ፈተናውን ይጀምሩ clicked) — up to 14 questions');
-                await takeQuiz(page, answers, { maxQuestions: 14, startIndex: answerIndex, label: 'Final exam' });
-                break;
-            }
-            await page.screenshot({ path: `debug-no-btn-${loop}.png` }).catch(() => {});
-        }
-
-        if (await page.locator('text=እንኳን ደስ, Completed, አልቋል').count() > 0) {
-            console.log("🎉 Course Completed!");
+        if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) {
+            console.log('🎉 Certified! እንኳን ደስ — course finished. Moving to logout → next user.');
             break;
         }
+
+        if (await page.locator('text=Your content is loading').isVisible({ timeout: 800 }).catch(() => false)) {
+            console.log('⏳ Content loading...');
+            await safePageWait(page, 5000);
+        }
+
+        await autoSkipVideo(page);
+
+        const scorm = getScormContentFrame(page);
+        const inActiveQuiz = scorm ? await isQuizScreen(scorm) : false;
+
+        // Step 5: ፈተናውን ይጀምሩ — green link on summary screen (before questions appear)
+        if (!inActiveQuiz && (await findExamStartButton(page))) {
+            console.log(`🔄 Loop ${loop} - Found ፈተናውን ይጀምሩ — clicking to start test...`);
+            const examResult = await clickExamStartButton(page);
+            if (examResult.clicked) {
+                await safePageWait(page, 2000);
+                if (await waitForQuizAfterExamStart(page)) {
+                    console.log('✅ Exam started — answering ALL questions until test ends...');
+                    answerIndex = await runQuizBlock(page, answers, answerIndex, 50, 'Exam');
+                    if (await isCourseCertified(page)) break;
+                    continue;
+                }
+                console.log('⚠️ Quiz UI not visible yet after ፈተናውን ይጀምሩ — will retry');
+            } else {
+                console.log('⚠️ Could not click ፈተናውን ይጀምሩ — will retry');
+            }
+        }
+
+        const scormNow = getScormContentFrame(page);
+        const inQuizNow = scormNow ? await isQuizScreen(scormNow) : false;
+        if (scormNow && inQuizNow) {
+            const stats = await getQuizStats(scormNow);
+            const looksLikeExam = (stats?.optionCount ?? 0) >= 8;
+            const safetyCap = looksLikeExam ? 50 : 30;
+            const label = looksLikeExam ? 'Chapter exam' : 'Chapter test';
+            console.log(`🔄 Loop ${loop} - ${label} (answer until finished)...`);
+            const before = answerIndex;
+            answerIndex = await runQuizBlock(page, answers, answerIndex, safetyCap, label);
+            if (answerIndex > before) {
+                if (await isCourseCertified(page)) break;
+                continue;
+            }
+        }
+
+        if (!/player\.php/i.test(page.url())) {
+            await enterScormPlayer(page);
+        }
+
+        console.log(`🔄 Loop ${loop} - መማር ይቀጥሉ (lesson only)...`);
+        const continueResult = await waitAndClickContinue(page);
+        if (continueResult.clicked) {
+            const sig = `${page.url()}|${continueResult.frameUrl}|${continueResult.method}`;
+            continueStreak = sig === lastContinueSig ? continueStreak + 1 : 1;
+            lastContinueSig = sig;
+
+            console.log(`✅ መማር ይቀጥሉ (${continueResult.method})`);
+            await safePageWait(page, CONTINUE_POST_CLICK_MS);
+            await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+
+            if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) break;
+
+            if (continueStreak >= 5) {
+                console.log('⚠️ Stuck on same continue — trying exam or player...');
+                await enterScormPlayer(page);
+                if (await findExamStartButton(page)) {
+                    const ex = await clickExamStartButton(page);
+                    if (ex.clicked) await waitForQuizAfterExamStart(page);
+                }
+                continueStreak = 0;
+                lastContinueSig = '';
+            }
+            continue;
+        } else {
+            continueStreak = 0;
+            lastContinueSig = '';
+        }
+
+        if (loop % 10 === 0) {
+            await page.screenshot({ path: `debug-stuck-${loop}.png` }).catch(() => {});
+        }
     }
+}
+
+/** Share shows this when the user is certified (course fully completed). */
+async function isCourseCertified(page: any): Promise<boolean> {
+    const certPhrases = [
+        'እንኳን ደስ',
+        'አጠናቀሃል',
+        'አጠናቀሻል',
+        'በስኬት አጠናቀሃል',
+        'በስኬት አጠናቀሻል',
+        'ሰርተፊኬት',
+        'የኮርሱን ሰርተፊኬት',
+    ];
+
+    for (const frame of page.frames()) {
+        try {
+            const found = await frame.evaluate((phrases: string[]) => {
+                const text = (document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ');
+                if (!text) return false;
+                const hasCongrats = /እንኳን ደስ/i.test(text);
+                const hasCompleted = /አጠናቀሃል|አጠናቀሻል|በስኬት.*ኮርስ/i.test(text);
+                const hasCertificate = /ሰርተፊኬት|certificate/i.test(text);
+                if (hasCongrats && (hasCompleted || hasCertificate)) return true;
+                return phrases.some((p) => text.includes(p)) && (hasCompleted || hasCertificate || hasCongrats);
+            }, certPhrases);
+            if (found) return true;
+        } catch {
+            /* frame detached */
+        }
+    }
+
+    try {
+        const n = await page.getByText(/እንኳን ደስ|አጠናቀሃል|አጠናቀሻል|ሰርተፊኬት|Course completed|certified/i).count();
+        return n > 0;
+    } catch {
+        return false;
+    }
+}
+
+const EXAM_START_TEXTS = ['ፈተናውን ይጀምሩ', 'ፈተና ይጀምሩ'];
+
+function orderFramesForScorm(page: any): any[] {
+    const frames = page.frames();
+    const scormContent = frames.filter((f: any) => /scormcontent/i.test(f.url()));
+    const scormPlayer = frames.filter((f: any) => /scorm|player/i.test(f.url()) && !/scormcontent/i.test(f.url()));
+    const rest = frames.filter((f: any) => !/scorm/i.test(f.url()));
+    return [...scormContent, ...scormPlayer, ...rest];
+}
+
+async function findExamStartButton(page: any): Promise<boolean> {
+    for (const frame of orderFramesForScorm(page)) {
+        try {
+            const found = await frame.evaluate(() => {
+                const needles = ['ፈተናውን ይጀምሩ', 'ፈተና ይጀምሩ'];
+                const nodes = [...document.querySelectorAll('a, button, span, p, div, label')];
+                return nodes.some((el) => {
+                    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!needles.some((n) => t.includes(n)) || t.length > 50) return false;
+                    const rect = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    return rect.width > 15 && rect.height > 6 && st.display !== 'none' && st.visibility !== 'hidden';
+                });
+            });
+            if (found) return true;
+        } catch {}
+    }
+    return false;
+}
+
+/** Click green "ፈተናውን ይጀምሩ >" link inside SCORM (span/div, not always a button). */
+async function clickExamStartButton(page: any): Promise<{ clicked: boolean; frameUrl: string; method: string }> {
+    for (const frame of orderFramesForScorm(page)) {
+        const frameUrl = frame.url();
+
+        for (const text of EXAM_START_TEXTS) {
+            try {
+                const loc = frame.getByText(text, { exact: false }).first();
+                if (await loc.isVisible({ timeout: 1200 })) {
+                    await loc.scrollIntoViewIfNeeded().catch(() => {});
+                    await loc.click({ force: true, timeout: 12000 });
+                    console.log(`✅ Clicked ፈተናውን ይጀምሩ via getByText in ${frameUrl}`);
+                    return { clicked: true, frameUrl, method: 'getByText' };
+                }
+            } catch {}
+
+            try {
+                const loc = frame.locator(`text=${text}`).first();
+                if (await loc.isVisible({ timeout: 1200 })) {
+                    await loc.scrollIntoViewIfNeeded().catch(() => {});
+                    await loc.click({ force: true, timeout: 12000 });
+                    console.log(`✅ Clicked ፈተናውን ይጀምሩ via text= in ${frameUrl}`);
+                    return { clicked: true, frameUrl, method: 'text-locator' };
+                }
+            } catch {}
+        }
+
+        try {
+            const target = await frame.evaluate(() => {
+                const needles = ['ፈተናውን ይጀምሩ', 'ፈተና ይጀምሩ'];
+                const nodes = [...document.querySelectorAll('a, button, span, p, div, label, [role="button"], [role="link"]')];
+                let best: { x: number; y: number; tag: string; text: string; area: number } | null = null;
+                for (const el of nodes) {
+                    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!needles.some((n) => t.includes(n)) || t.length > 50) continue;
+                    const rect = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    if (rect.width < 15 || rect.height < 6) continue;
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    const area = rect.width * rect.height;
+                    if (!best || area < best.area) {
+                        best = {
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                            tag: el.tagName,
+                            text: t.slice(0, 60),
+                            area,
+                        };
+                    }
+                }
+                if (!best) return null;
+                const el = document.elementFromPoint(best.x, best.y) as HTMLElement | null;
+                (el || document.body).dispatchEvent(new Event('scroll'));
+                const clickEl = [...document.querySelectorAll('a, button, span, p, div')].find((n) => {
+                    const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
+                    return needles.some((nd) => t.includes(nd)) && t.length < 50;
+                }) as HTMLElement | undefined;
+                clickEl?.scrollIntoView({ block: 'center', inline: 'center' });
+                clickEl?.click();
+                return best;
+            });
+            if (target) {
+                try {
+                    await frame.mouse.click(target.x, target.y);
+                } catch {}
+                console.log(`✅ Clicked ፈተናውን ይጀምሩ via DOM (${target.tag}: "${target.text}")`);
+                return { clicked: true, frameUrl, method: `evaluate:${target.tag}` };
+            }
+        } catch {}
+    }
+
+    const fallback = await clickTextInFrames(page, EXAM_START_TEXTS, { examMode: true });
+    if (fallback.clicked) {
+        console.log(`✅ Clicked ፈተናውን ይጀምሩ via ${fallback.method}`);
+    }
+    return fallback;
+}
+
+async function waitForQuizAfterExamStart(page: any, maxWaitMs = 15000): Promise<boolean> {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        const sc = getScormContentFrame(page);
+        if (sc && (await isQuizScreen(sc))) return true;
+        await safePageWait(page, 600);
+    }
+    return false;
 }
 
 async function autoSkipVideo(page: any) {
@@ -1271,56 +1722,6 @@ async function autoSkipVideo(page: any) {
             if (v.duration) v.currentTime = v.duration - 5;
         });
     });
-}
-
-async function takeQuiz(
-    page: any,
-    answers: string[],
-    opts: { maxQuestions: number; startIndex: number; label: string } = { maxQuestions: 14, startIndex: 0, label: 'Final exam' }
-) {
-    console.log(`🧠 ${opts.label} — up to ${opts.maxQuestions} questions (${answers.length} answers in CSV)...`);
-    let idx = opts.startIndex;
-    let failStreak = 0;
-
-    for (let q = 0; q < opts.maxQuestions; q++) {
-        await page.waitForTimeout(3000);
-        const frame = getScormContentFrame(page);
-        if (!frame || !(await isQuizScreen(frame))) {
-            failStreak++;
-            if (failStreak >= 3) {
-                console.log(`⚠️ No quiz UI after Q${q} — stopping ${opts.label}`);
-                break;
-            }
-            await page.waitForTimeout(2000);
-            continue;
-        }
-        failStreak = 0;
-
-        const stats = await getQuizStats(frame);
-        const answer = answers[idx] ?? answers[idx % Math.max(answers.length, 1)] ?? 'ለ';
-        const ok = await selectQuizAnswer(frame, answer);
-        // #region agent log
-        debugLog({
-            hypothesisId: 'H3',
-            location: 'bot.ts:takeQuiz',
-            message: 'final exam answer',
-            data: { q: q + 1, answerIndex: idx, answer, ok, frameUrl: frame.url(), stats },
-        });
-        // #endregion
-
-        console.log(`  Q${q + 1} → ${answer} ${ok ? '✓' : '✗'}`);
-        if (!ok) break;
-
-        idx++;
-        await page.waitForTimeout(400);
-        await clickSubmitYasebu(page);
-        await page.waitForTimeout(700);
-    }
-
-    if (!(await quizScreenActive(page))) {
-        await waitAndClickContinue(page);
-    }
-    console.log(`✅ ${opts.label} completed`);
 }
 
 main().catch(console.error);
