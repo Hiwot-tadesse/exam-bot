@@ -6,7 +6,12 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const BOT_VERSION = 'v14-login-progress';
+const BOT_VERSION = 'v17-nine-steps';
+
+/** 9-step workflow (see processStudent + runCourseFlow). */
+function stepLog(step: number, message: string): void {
+    console.log(`\n📍 Step ${step}: ${message}`);
+}
 const CONTINUE_POLL_MS = 350;
 const CONTINUE_POST_CLICK_MS = 1500;
 const CHAPTER_QUIZ_MAX_Q = 6;
@@ -645,6 +650,11 @@ async function clickTextInFrames(
 
 /** Click መማር ይቀጥሉ only inside SCORM lesson frames (not Moodle sidebar). */
 async function waitAndClickContinue(page: any): Promise<{ clicked: boolean; frameUrl: string; matchedText: string; method: string }> {
+    if (await isMoodleErrorPage(page)) {
+        await launchScormFromView(page);
+        return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'error-recover' };
+    }
+
     if (await quizScreenActive(page)) {
         return { clicked: false, frameUrl: page.url(), matchedText: '', method: 'quiz-active' };
     }
@@ -723,10 +733,78 @@ async function loginStudent(page: any, username: string, password: string): Prom
     } catch {
         /* check URL below */
     }
+
+    if (!/login\/index\.php/i.test(page.url())) {
+        await page.goto('https://learn.share.com.et/my/courses.php', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+        }).catch(() => {});
+        await safePageWait(page, 4000);
+    }
+}
+
+const VIEW_COURSE_LOCATORS = [
+    'a.view-course-btn',
+    'a[title="View Course"]',
+    'a:has-text("View Course")',
+    'button:has-text("View Course")',
+    'a[href*="course/view.php?id="]',
+];
+
+async function countViewCourseButtons(page: any): Promise<number> {
+    let max = 0;
+    for (const sel of VIEW_COURSE_LOCATORS) {
+        const n = await page.locator(sel).count().catch(() => 0);
+        if (n > max) max = n;
+    }
+    return max;
+}
+
+async function scrollCoursesGrid(page: any): Promise<void> {
+    await page.evaluate(() => {
+        window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => {});
+    await safePageWait(page, 1500);
+    await page.evaluate(() => {
+        window.scrollTo(0, 0);
+    }).catch(() => {});
+    await safePageWait(page, 800);
+}
+
+async function navigateToMyCourses(page: any): Promise<void> {
+    if ((await countViewCourseButtons(page)) > 0) return;
+
+    const urls = [
+        'https://learn.share.com.et/my/courses.php',
+        'https://learn.share.com.et/my/',
+    ];
+
+    for (const url of urls) {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await safePageWait(page, 5000);
+        await scrollCoursesGrid(page);
+        if ((await countViewCourseButtons(page)) > 0) return;
+    }
+
+    for (const nav of [
+        () => page.getByRole('link', { name: /my courses/i }).first(),
+        () => page.locator('a[href*="my/courses"]').first(),
+        () => page.getByText('My courses', { exact: false }).first(),
+    ]) {
+        try {
+            const link = nav();
+            if (await link.isVisible({ timeout: 2000 })) {
+                await link.click({ timeout: 10000 });
+                await safePageWait(page, 5000);
+                await scrollCoursesGrid(page);
+                if ((await countViewCourseButtons(page)) > 0) return;
+            }
+        } catch {}
+    }
 }
 
 async function ensureLoggedIn(page: any, username: string, password: string): Promise<void> {
-    await loginStudent(page, username, password);
+    await loginStudent(page, username, password); // Step 1 — login
 
     if (/login\/index\.php/i.test(page.url())) {
         const errMsg = await page
@@ -739,27 +817,36 @@ async function ensureLoggedIn(page: any, username: string, password: string): Pr
         );
     }
 
-    await goToMyCourses(page);
+    await navigateToMyCourses(page);
 
-    const courseCount = await page.locator('a.view-course-btn').count().catch(() => 0);
-    if (courseCount === 0 && /login/i.test(page.url())) {
+    const cards = await waitForCoursesGrid(page);
+    if (cards.length > 0) {
+        console.log(`✅ Logged in (${cards.length} courses on grid)`);
+        return;
+    }
+
+    const btnCount = await countViewCourseButtons(page);
+    if (btnCount === 0 && /login/i.test(page.url())) {
         throw new Error(`Login failed for ${username} — My courses redirected to login`);
     }
-    if (courseCount === 0) {
-        throw new Error(`Logged in but no View Course buttons found on My courses`);
+    if (btnCount === 0) {
+        throw new Error(`Logged in but no courses found on My courses (${page.url()})`);
     }
-    console.log(`✅ Logged in (${courseCount} courses on grid)`);
+
+    console.log(`✅ Logged in (${btnCount} View Course buttons)`);
 }
 
 function isValidCourseCard(c: CourseCardInfo): boolean {
     if (!c.courseId || !/^\d+$/.test(c.courseId)) return false;
     if (!c.href || !/course\/view\.php\?id=\d+/i.test(c.href)) return false;
     const t = c.title;
-    if (t.length > 150 || t.length < 8) return false;
+    if (t.length > 150 || t.length < 5) return false;
     if (/welcome to share|enter your details|username|password|skip to main|cdata|jsenabled|forgot your password|log in english/i.test(t)) {
         return false;
     }
-    return /[\u1200-\u137F]{2,}/.test(t) && /\([A-Za-z][^)]{2,80}\)/.test(t);
+    if (/[\u1200-\u137F]{2,}/.test(t) && /\([^)]{2,80}\)/.test(t)) return true;
+    if (/\([A-Za-z][^)]{2,80}\)/.test(t) && t.length >= 10) return true;
+    return !/^Course \d+$/i.test(t.trim()) && t.length >= 12;
 }
 
 // ====================== COURSE PICKER (My courses grid) ======================
@@ -846,7 +933,10 @@ async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
             if (!title || title.length < 5) title = titleFallback;
             if (!courseId || !/course\/view\.php/i.test(href)) return;
             if (/welcome to share|username|password|skip to main|cdata|jsenabled/i.test(cardText)) return;
-            if (!/[\u1200-\u137F]{2,}/.test(title) || !/\([A-Za-z][^)]{2,80}\)/.test(title)) return;
+            const hasTitle =
+                (/[\u1200-\u137F]{2,}/.test(title) && /\([^)]{2,80}\)/.test(title)) ||
+                (/\([A-Za-z][^)]{2,80}\)/.test(title) && title.length >= 10);
+            if (!hasTitle && /^Course \d+$/i.test(title)) return;
             const pctMatch = cardText.match(/(\d+)%\s*Course completed/i);
             const percent = pctMatch ? parseInt(pctMatch[1], 10) : 0;
             const completed = percent >= 100 || /100%\s*Course completed/i.test(cardText);
@@ -913,36 +1003,41 @@ async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
             });
         }
 
+        if (!results.length) {
+            document.querySelectorAll('a[href*="course/view.php?id="]').forEach((link, buttonIndex) => {
+                const anchor = link as HTMLAnchorElement;
+                const href = anchor.href || '';
+                const idMatch = href.match(/[?&]id=(\d+)/);
+                if (!idMatch) return;
+                const cardTitle = titleFromCard(link) || cardTextFromNode(link);
+                const cardText = cardTitle || (link.textContent || '').replace(/\s+/g, ' ').trim();
+                pushCard(cardText, `Course ${buttonIndex + 1}`, buttonIndex, idMatch[1], href);
+            });
+        }
+
         return results;
     });
 }
 
 async function waitForCoursesGrid(page: any): Promise<CourseCardInfo[]> {
-    const selectors = [
-        'a:has-text("View Course")',
-        'button:has-text("View Course")',
-        'a[href*="course/view"]',
-        'text=Course completed',
-    ];
-
-    for (let attempt = 0; attempt < 8; attempt++) {
-        if (attempt > 0) await safePageWait(page, 3500);
-
-        for (const sel of selectors) {
-            await page.locator(sel).first().waitFor({ state: 'visible', timeout: 6000 }).catch(() => {});
+    for (let attempt = 0; attempt < 12; attempt++) {
+        if (attempt > 0) {
+            await safePageWait(page, 3500);
+            if (attempt === 3) await navigateToMyCourses(page);
         }
 
-        await page.evaluate(() => {
-            window.scrollTo(0, document.body.scrollHeight);
-        }).catch(() => {});
-        await safePageWait(page, 1200);
-        await page.evaluate(() => {
-            window.scrollTo(0, 0);
-        }).catch(() => {});
-        await safePageWait(page, 800);
+        for (const sel of VIEW_COURSE_LOCATORS) {
+            await page.locator(sel).first().waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
+        }
+        await page.getByText(/Course completed|%\s*Course completed/i).first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+
+        await scrollCoursesGrid(page);
 
         const raw = await listCoursesOnPage(page);
-        const cards = raw.filter(isValidCourseCard);
+        let cards = raw.filter(isValidCourseCard);
+        if (!cards.length) {
+            cards = raw.filter((c) => c.courseId && c.href && /course\/view\.php/i.test(c.href));
+        }
         debugLog({
             hypothesisId: 'H2',
             runId: 'pre-fix',
@@ -1027,12 +1122,7 @@ async function waitForOpenedCourse(page: any, timeoutMs = 45000): Promise<boolea
 }
 
 async function goToMyCourses(page: any): Promise<void> {
-    await page.goto('https://learn.share.com.et/my/courses.php', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-    });
-    await safePageWait(page, 4000);
-    await page.locator('a.view-course-btn').first().waitFor({ state: 'visible', timeout: 25000 }).catch(() => {});
+    await navigateToMyCourses(page);
 }
 
 /** Navigate without waiting for commit (Moodle often never fires it). */
@@ -1145,7 +1235,11 @@ async function openCourseFromGrid(
         if (/login\/index/i.test(page.url())) {
             throw new Error('No courses — still on login page (login did not succeed)');
         }
-        throw new Error('No valid courses on My courses page (need View Course buttons with course id)');
+        const btnCount = await countViewCourseButtons(page);
+        if (btnCount > 0) {
+            throw new Error(`Found ${btnCount} View Course buttons but could not read course names`);
+        }
+        throw new Error(`No courses on My courses (${page.url()})`);
     }
 
     const preference = (student.course || student.coursename || '').toString().trim();
@@ -1218,6 +1312,7 @@ async function openCourseFromGrid(
 async function main() {
     const availableCourses = listAnswerFiles();
     console.log(`🚀 Share eLearning Bot ${BOT_VERSION}`);
+    console.log('📋 Workflow: 1 Login → 2 View Course → 3 Start → 4 Continue loop → 5 Exam → 6 Answer → 7 Continue → 8 Certified → 9 Logout');
     console.log(`📂 Running: ${__filename}`);
     console.log(`📂 CWD: ${process.cwd()}`);
     console.log(`📚 Answer files for any course: ${availableCourses.join(', ') || '(none)'}\n`);
@@ -1256,14 +1351,11 @@ async function processStudent(student: any, usedCourseIndices: Set<number>, stud
 
     try {
         const password = (student.password || `${username}@R&D`).toString();
-        await ensureLoggedIn(page, username, password);
-        debugLog({
-            hypothesisId: 'H3',
-            location: 'bot.ts:processStudent',
-            message: 'logged in',
-            data: { username, pageUrl: page.url() },
-        });
 
+        stepLog(1, 'Login from data.csv');
+        await ensureLoggedIn(page, username, password);
+
+        stepLog(2, 'My courses → pick random course → click View Course');
         const courseTitle = await openCourseFromGrid(page, student, usedCourseIndices, studentOrdinal);
         console.log(`📘 Course: ${courseTitle}`);
 
@@ -1274,9 +1366,9 @@ async function processStudent(student: any, usedCourseIndices: Set<number>, stud
         const answers = await loadAnswers(courseTitle);
 
         if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) {
-            console.log('🎉 Course already complete/certified — logout → next user');
+            stepLog(8, 'Course already certified');
         } else {
-            await runCourseUntilCertified(page, answers);
+            await runCourseFlow(page, answers);
         }
 
     } catch (e: any) {
@@ -1287,9 +1379,20 @@ async function processStudent(student: any, usedCourseIndices: Set<number>, stud
             console.log(`❌ Error: ${msg}`);
         }
     } finally {
+        stepLog(9, 'Logout → next student');
         await logoutUser(page).catch(() => {});
         await browser.close();
     }
+}
+
+/** Step 3 or 7: single መማር ይቀጥሉ click (not a poll loop). */
+async function clickContinueOnce(page: any, label: string): Promise<boolean> {
+    const result = await waitAndClickContinue(page);
+    if (result.clicked) {
+        console.log(`   ✅ ${label} — መማር ይቀጥሉ (${result.method})`);
+        await safePageWait(page, CONTINUE_POST_CLICK_MS);
+    }
+    return result.clicked;
 }
 
 async function logoutUser(page: any): Promise<void> {
@@ -1372,6 +1475,7 @@ async function runQuizBlock(
             break;
         }
 
+        // Step 6: answer → ያስገቡ → ይቀጥሉ
         const result = await answerOneQuizQuestion(page, answers, idx, q + 1, label);
         if (!result.ok) {
             console.log(`   ⚠️ ${label}: failed to answer Q${q + 1} — stopping`);
@@ -1399,44 +1503,181 @@ async function runQuizBlock(
     return idx;
 }
 
-/** Open SCORM player from view.php (Moodle shell → actual lesson iframe). */
-async function enterScormPlayer(page: any): Promise<boolean> {
-    if (/mod\/scorm\/player\.php/i.test(page.url())) return true;
+async function isMoodleErrorPage(page: any): Promise<boolean> {
+    try {
+        const text = (await page.locator('body').innerText({ timeout: 2000 }).catch(() => '')) || '';
+        return /required parameter|missingparam|scoid.*missing|moodle_exception/i.test(text);
+    } catch {
+        return false;
+    }
+}
 
-    const idMatch = page.url().match(/[?&]id=(\d+)/);
-    if (idMatch) {
-        const playerUrl = page.url().replace(/view\.php/, 'player.php');
-        try {
-            await page.goto(playerUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-            await safePageWait(page, 3000);
-            if (/player\.php/i.test(page.url())) {
-                console.log('📦 Entered SCORM player');
+function scormViewUrlFromPage(page: any): string | null {
+    const id = page.url().match(/[?&]id=(\d+)/)?.[1];
+    return id ? `https://learn.share.com.et/mod/scorm/view.php?id=${id}` : null;
+}
+
+/** Find player.php link that includes scoid (required by Moodle). */
+async function findScormLaunchHref(page: any): Promise<string | null> {
+    try {
+        return await page.evaluate(() => {
+            const links = [...document.querySelectorAll('a[href*="player.php"]')] as HTMLAnchorElement[];
+            let best = '';
+            for (const a of links) {
+                const h = a.href || '';
+                if (!h.includes('mod/scorm/player') || !h.includes('scoid=')) continue;
+                if (!best || h.length < best.length) best = h;
+            }
+            return best || null;
+        });
+    } catch {
+        return null;
+    }
+}
+
+/** Launch SCORM correctly from view.php — click Enter/Launch button or any link to player.php. */
+async function launchScormFromView(page: any): Promise<boolean> {
+    if (await isMoodleErrorPage(page)) {
+        const viewUrl = scormViewUrlFromPage(page);
+        if (viewUrl) {
+            console.log('⚠️ SCORM error page — returning to view.php...');
+            await page.goto(viewUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await safePageWait(page, 2500);
+        }
+    }
+
+    // Already on player.php with scoid — good
+    if (/mod\/scorm\/player\.php/i.test(page.url()) && /scoid=/i.test(page.url())) {
+        if (!(await isMoodleErrorPage(page))) {
+            return true;
+        }
+    }
+
+    // Already on player.php without scoid but no error — still good (some Moodle versions)
+    if (/mod\/scorm\/player\.php/i.test(page.url()) && !(await isMoodleErrorPage(page))) {
+        return true;
+    }
+
+    // If we have a scorm content iframe already loaded, we're good
+    const existingScorm = getScormContentFrame(page);
+    if (existingScorm) {
+        console.log('📦 SCORM content frame already loaded');
+        return true;
+    }
+
+    if (!/view\.php|course\/view\.php/i.test(page.url())) {
+        return /player\.php/i.test(page.url()) && !(await isMoodleErrorPage(page));
+    }
+
+    // Strategy 1: Find player.php link with scoid
+    let launchHref = await findScormLaunchHref(page);
+    if (launchHref) {
+        console.log(`📦 Launching SCORM (scoid link): ${launchHref.slice(0, 90)}...`);
+        await page.goto(launchHref, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await safePageWait(page, 3500);
+        if (/player\.php/i.test(page.url()) && !(await isMoodleErrorPage(page))) {
+            console.log('📦 SCORM player ready');
+            return true;
+        }
+    }
+
+    // Strategy 2: Click any Enter/Launch/Start button or link on the view page
+    const launched = await page.evaluate(() => {
+        // Look for forms submitting to player.php
+        const forms = [...document.querySelectorAll('form[action*="player.php"]')];
+        if (forms.length > 0) {
+            (forms[0] as HTMLFormElement).submit();
+            return 'form-submit';
+        }
+
+        // Look for any button/link with Enter/Launch/Start text
+        const clickables = [...document.querySelectorAll('a, button, input[type="submit"], input[type="button"]')];
+        for (const el of clickables) {
+            const t = ((el as HTMLElement).textContent || (el as HTMLInputElement).value || '').trim();
+            const href = (el as HTMLAnchorElement).href || '';
+            // Click links to player.php (even without scoid — server may handle it)
+            if (href.includes('player.php')) {
+                (el as HTMLElement).click();
+                return `link:${t.slice(0, 30)}`;
+            }
+            // Click "Enter" / "Launch" / "Start" buttons
+            if (/^(enter|launch|start|preview|attempt)$/i.test(t) || /enter course|launch course|start course/i.test(t)) {
+                (el as HTMLElement).click();
+                return `button:${t.slice(0, 30)}`;
+            }
+        }
+
+        // Look for any submit button inside a form on the page
+        const submitBtns = [...document.querySelectorAll('form input[type="submit"], form button[type="submit"]')];
+        for (const btn of submitBtns) {
+            const t = ((btn as HTMLElement).textContent || (btn as HTMLInputElement).value || '').trim();
+            if (t && !/login|log in|search/i.test(t)) {
+                (btn as HTMLElement).click();
+                return `form-btn:${t.slice(0, 30)}`;
+            }
+        }
+
+        return null;
+    }).catch(() => null);
+
+    if (launched) {
+        console.log(`📦 SCORM launch attempt: ${launched}`);
+        await safePageWait(page, 5000);
+        // Wait for navigation to player.php or for SCORM iframe to appear
+        for (let i = 0; i < 10; i++) {
+            if (/player\.php/i.test(page.url()) && !(await isMoodleErrorPage(page))) {
+                console.log('📦 SCORM player ready');
                 return true;
+            }
+            if (getScormContentFrame(page)) {
+                console.log('📦 SCORM content frame loaded');
+                return true;
+            }
+            await safePageWait(page, 1000);
+        }
+    }
+
+    // Strategy 3: Playwright locator-based clicks
+    const enterSelectors = [
+        'a[href*="player.php"]',
+        'button:has-text("Enter")',
+        'input[value="Enter"]',
+        'button:has-text("Launch")',
+        'button:has-text("Start")',
+        'input[value="Launch"]',
+        'input[value="Start"]',
+        'a:has-text("Enter")',
+        'a:has-text("Launch")',
+        '#scormviewform input[type="submit"]',
+        'form[action*="player"] input[type="submit"]',
+        'form[action*="player"] button',
+    ];
+
+    for (const sel of enterSelectors) {
+        try {
+            const btn = page.locator(sel).first();
+            if (await btn.isVisible({ timeout: 1500 })) {
+                console.log(`📦 Clicking SCORM launch: ${sel}`);
+                await btn.click({ timeout: 15000 });
+                await safePageWait(page, 5000);
+                if (/player\.php/i.test(page.url()) && !(await isMoodleErrorPage(page))) {
+                    console.log('📦 SCORM player ready');
+                    return true;
+                }
+                if (getScormContentFrame(page)) {
+                    console.log('📦 SCORM content frame loaded');
+                    return true;
+                }
             }
         } catch {}
     }
 
-    try {
-        const clicked = await page.evaluate(() => {
-            const link = [...document.querySelectorAll('a[href*="player.php"]')].find((a) =>
-                (a as HTMLAnchorElement).href?.includes('mod/scorm/player')
-            ) as HTMLAnchorElement | undefined;
-            if (link) {
-                link.click();
-                return true;
-            }
-            return false;
-        });
-        if (clicked) {
-            await page.waitForURL(/player\.php/i, { timeout: 20000 }).catch(() => {});
-            return /player\.php/i.test(page.url());
-        }
-    } catch {}
-
-    return /player\.php/i.test(page.url());
+    console.log('⚠️ No SCORM launch button found on view page');
+    return false;
 }
 
 async function isCourseAlreadyComplete(page: any): Promise<boolean> {
+    if (await isMoodleErrorPage(page)) return false;
     if (await isCourseCertified(page)) return true;
     for (const frame of page.frames()) {
         try {
@@ -1451,116 +1692,86 @@ async function isCourseAlreadyComplete(page: any): Promise<boolean> {
     return false;
 }
 
-/** Steps 3–8: start with መማር ይቀጥሉ, skip videos, quizzes, exams, until certified. */
-async function runCourseUntilCertified(page: any, answers: string[] = []) {
+/** Steps 3–8: start course → loop lessons → exams → certified. */
+async function runCourseFlow(page: any, answers: string[] = []) {
     let loop = 0;
     let answerIndex = 0;
-    let continueStreak = 0;
-    let lastContinueSig = '';
 
-    await enterScormPlayer(page);
+    await launchScormFromView(page);
 
-    console.log('▶️ Step 3: Start lesson (መማር ይቀጥሉ inside SCORM if visible)...');
-    const startCont = await waitAndClickContinue(page);
-    if (startCont.clicked) {
-        console.log(`✅ Started lesson via ${startCont.method}`);
-        await safePageWait(page, CONTINUE_POST_CLICK_MS);
-    }
+    stepLog(3, 'Click መማር ይቀጥሉ once to start course (if visible)');
+    await clickContinueOnce(page, 'Start course');
 
     while (loop < 150) {
         loop++;
         await safePageWait(page, 400);
 
+        // Step 8: repeat until certified
         if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) {
-            console.log('🎉 Certified! እንኳን ደስ — course finished. Moving to logout → next user.');
+            stepLog(8, 'Course certified — እንኳን ደስ');
             break;
         }
 
         if (await page.locator('text=Your content is loading').isVisible({ timeout: 800 }).catch(() => false)) {
-            console.log('⏳ Content loading...');
             await safePageWait(page, 5000);
         }
 
-        await autoSkipVideo(page);
+        if (await isMoodleErrorPage(page)) {
+            await launchScormFromView(page);
+        } else if (/view\.php/i.test(page.url()) && !getScormContentFrame(page)) {
+            await launchScormFromView(page);
+        }
 
         const scorm = getScormContentFrame(page);
-        const inActiveQuiz = scorm ? await isQuizScreen(scorm) : false;
+        const inQuiz = scorm ? await isQuizScreen(scorm) : false;
 
-        // Step 5: ፈተናውን ይጀምሩ — green link on summary screen (before questions appear)
-        if (!inActiveQuiz && (await findExamStartButton(page))) {
-            console.log(`🔄 Loop ${loop} - Found ፈተናውን ይጀምሩ — clicking to start test...`);
+        // Step 5 + 6 + 7: exam (ፈተናውን ይጀምሩ)
+        if (!inQuiz && (await findExamStartButton(page))) {
+            stepLog(5, 'Click ፈተናውን ይጀምሩ → start exam');
             const examResult = await clickExamStartButton(page);
             if (examResult.clicked) {
                 await safePageWait(page, 2000);
                 if (await waitForQuizAfterExamStart(page)) {
-                    console.log('✅ Exam started — answering ALL questions until test ends...');
-                    answerIndex = await runQuizBlock(page, answers, answerIndex, 50, 'Exam');
-                    if (await isCourseCertified(page)) break;
+                    stepLog(6, 'Answer all questions (answer → ያስገቡ → ይቀጥሉ) from answers CSV');
+                    answerIndex = await runQuizBlock(page, answers, answerIndex, 50, 'Final exam');
+                    stepLog(7, 'After test → click መማር ይቀጥሉ');
+                    await clickContinueOnce(page, 'After exam');
+                    if (await isCourseCertified(page)) continue;
                     continue;
                 }
-                console.log('⚠️ Quiz UI not visible yet after ፈተናውን ይጀምሩ — will retry');
-            } else {
-                console.log('⚠️ Could not click ፈተናውን ይጀምሩ — will retry');
             }
         }
 
-        const scormNow = getScormContentFrame(page);
-        const inQuizNow = scormNow ? await isQuizScreen(scormNow) : false;
-        if (scormNow && inQuizNow) {
-            const stats = await getQuizStats(scormNow);
-            const looksLikeExam = (stats?.optionCount ?? 0) >= 8;
-            const safetyCap = looksLikeExam ? 50 : 30;
-            const label = looksLikeExam ? 'Chapter exam' : 'Chapter test';
-            console.log(`🔄 Loop ${loop} - ${label} (answer until finished)...`);
+        // Mid-course quiz (steps 4–6, smaller tests)
+        if (scorm && inQuiz) {
+            stepLog(6, 'Mid-course quiz — answer → ያስገቡ → ይቀጥሉ');
             const before = answerIndex;
-            answerIndex = await runQuizBlock(page, answers, answerIndex, safetyCap, label);
+            answerIndex = await runQuizBlock(page, answers, answerIndex, CHAPTER_QUIZ_MAX_Q, 'Chapter test');
             if (answerIndex > before) {
-                if (await isCourseCertified(page)) break;
+                stepLog(7, 'After quiz → መማር ይቀጥሉ');
+                await clickContinueOnce(page, 'After chapter test');
                 continue;
             }
         }
 
-        if (!/player\.php/i.test(page.url())) {
-            await enterScormPlayer(page);
-        }
+        // Step 4: skip videos + መማር ይቀጥሉ until ፈተናውን ይጀምሩ
+        console.log(`   Step 4 (loop ${loop}): skip video + መማር ይቀጥሉ...`);
+        await autoSkipVideo(page);
+        const continued = await clickContinueOnce(page, 'Continue lesson');
 
-        console.log(`🔄 Loop ${loop} - መማር ይቀጥሉ (lesson only)...`);
-        const continueResult = await waitAndClickContinue(page);
-        if (continueResult.clicked) {
-            const sig = `${page.url()}|${continueResult.frameUrl}|${continueResult.method}`;
-            continueStreak = sig === lastContinueSig ? continueStreak + 1 : 1;
-            lastContinueSig = sig;
-
-            console.log(`✅ መማር ይቀጥሉ (${continueResult.method})`);
-            await safePageWait(page, CONTINUE_POST_CLICK_MS);
-            await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
-
-            if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) break;
-
-            if (continueStreak >= 5) {
-                console.log('⚠️ Stuck on same continue — trying exam or player...');
-                await enterScormPlayer(page);
-                if (await findExamStartButton(page)) {
-                    const ex = await clickExamStartButton(page);
-                    if (ex.clicked) await waitForQuizAfterExamStart(page);
-                }
-                continueStreak = 0;
-                lastContinueSig = '';
+        if (!continued && !(await findExamStartButton(page)) && !inQuiz) {
+            if (loop % 8 === 0) {
+                await launchScormFromView(page);
+                await page.screenshot({ path: `debug-stuck-${loop}.png` }).catch(() => {});
             }
-            continue;
-        } else {
-            continueStreak = 0;
-            lastContinueSig = '';
-        }
-
-        if (loop % 10 === 0) {
-            await page.screenshot({ path: `debug-stuck-${loop}.png` }).catch(() => {});
         }
     }
 }
 
 /** Share shows this when the user is certified (course fully completed). */
 async function isCourseCertified(page: any): Promise<boolean> {
+    if (await isMoodleErrorPage(page)) return false;
+
     const certPhrases = [
         'እንኳን ደስ',
         'አጠናቀሃል',
