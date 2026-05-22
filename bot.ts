@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const BOT_VERSION = 'v8-unique-random-course';
+const BOT_VERSION = 'v9-view-course-btn';
 const CONTINUE_POLL_MS = 350;
 const CONTINUE_POST_CLICK_MS = 1500;
 const CHAPTER_QUIZ_MAX_Q = 6;
@@ -22,6 +22,15 @@ function debugLog(payload: Record<string, unknown>) {
         headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '93bca3' },
         body: line.trim(),
     }).catch(() => {});
+}
+
+async function safePageWait(page: any, ms: number): Promise<void> {
+    try {
+        if (page.isClosed()) return;
+        await page.waitForTimeout(ms);
+    } catch {
+        /* page closed or navigated away */
+    }
 }
 
 // ====================== ANSWERS ======================
@@ -234,8 +243,21 @@ async function getQuizStats(frame: any): Promise<QuizStats | null> {
     }
 }
 
+/** Single quiz detector — no mutual recursion with isChapterQuizScreen */
+async function detectQuizScreen(frame: any): Promise<boolean> {
+    const stats = await getQuizStats(frame);
+    if (stats && (stats.optionCount >= 2 || stats.radioCount >= 2)) return true;
+    try {
+        if (await frame.locator('button:has-text("ያስገቡ")').first().isVisible({ timeout: 400 })) return true;
+    } catch {}
+    try {
+        if ((await frame.locator('input[type="radio"]').count()) >= 2) return true;
+    } catch {}
+    return false;
+}
+
 async function isQuizScreen(frame: any): Promise<boolean> {
-    return isChapterQuizScreen(frame);
+    return detectQuizScreen(frame);
 }
 
 async function clickAnswerByLetter(frame: any, answer: string): Promise<boolean> {
@@ -355,6 +377,35 @@ async function selectQuizAnswer(frame: any, answer: string): Promise<boolean> {
     return false;
 }
 
+async function clickNextBekuty(page: any): Promise<boolean> {
+    for (const frame of sortFramesByContent(page.frames())) {
+        for (const label of ['ቀጣይ', 'Next']) {
+            try {
+                const exact = frame.getByRole('button', { name: label, exact: true });
+                if (await exact.isVisible({ timeout: 500 })) {
+                    await exact.click({ force: true, timeout: 8000 });
+                    debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next', data: { frameUrl: frame.url(), label, method: 'role' } });
+                    return true;
+                }
+            } catch {}
+            try {
+                const btn = frame.locator(`button:has-text("${label}")`).first();
+                if (await btn.isVisible({ timeout: 500 })) {
+                    await btn.click({ force: true, timeout: 8000 });
+                    debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next', data: { frameUrl: frame.url(), label, method: 'has-text' } });
+                    return true;
+                }
+            } catch {}
+        }
+    }
+    const result = await clickTextInFrames(page, ['ቀጣይ', 'Next'], { examMode: true });
+    if (result.clicked) {
+        debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next via frames', data: result });
+        return true;
+    }
+    return false;
+}
+
 async function clickSubmitYasebu(page: any): Promise<boolean> {
     for (const frame of sortFramesByContent(page.frames())) {
         try {
@@ -378,12 +429,7 @@ async function clickSubmitYasebu(page: any): Promise<boolean> {
 }
 
 async function isChapterQuizScreen(frame: any): Promise<boolean> {
-    if (await isQuizScreen(frame)) return true;
-    try {
-        return await frame.locator('button:has-text("ያስገቡ")').first().isVisible({ timeout: 400 });
-    } catch {
-        return false;
-    }
+    return detectQuizScreen(frame);
 }
 
 async function quizScreenActive(page: any): Promise<boolean> {
@@ -588,7 +634,7 @@ async function waitAndClickContinue(page: any): Promise<{ clicked: boolean; fram
     const t0 = Date.now();
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        if (attempt > 0) await page.waitForTimeout(CONTINUE_POLL_MS);
+        if (attempt > 0) await safePageWait(page, CONTINUE_POLL_MS);
 
         if (await quizScreenActive(page)) {
             continue;
@@ -614,41 +660,189 @@ async function waitAndClickContinue(page: any): Promise<{ clicked: boolean; fram
 }
 
 // ====================== COURSE PICKER (My courses grid) ======================
-type CourseCardInfo = { title: string; percent: number; completed: boolean; index: number };
+type CourseCardInfo = {
+    title: string;
+    percent: number;
+    completed: boolean;
+    index: number;
+    buttonIndex: number;
+    courseId: string;
+    href: string;
+};
 
 async function listCoursesOnPage(page: any): Promise<CourseCardInfo[]> {
     return page.evaluate(() => {
-        const results: { title: string; percent: number; completed: boolean; index: number }[] = [];
-        const viewButtons = [...document.querySelectorAll('a, button')].filter((el) =>
-            /view course/i.test((el.textContent || '').trim())
-        );
+        type Row = {
+            title: string;
+            percent: number;
+            completed: boolean;
+            index: number;
+            buttonIndex: number;
+            courseId: string;
+            href: string;
+        };
+        const results: Row[] = [];
 
-        viewButtons.forEach((btn, index) => {
-            let cardText = '';
-            let node: Element | null = btn;
-            for (let depth = 0; depth < 10 && node; depth++) {
-                node = node.parentElement;
-                if (!node) break;
+        const cardTextFromNode = (start: Element | null): string => {
+            let node: Element | null = start?.parentElement ?? null;
+            let best = '';
+            while (node) {
                 const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-                if (text.includes('(') && text.includes(')') && text.length > 40) {
-                    cardText = text;
+                const viewInNode = [...node.querySelectorAll('a, button')].filter((el) =>
+                    /view course/i.test((el.textContent || '').trim())
+                ).length;
+                if (
+                    viewInNode <= 1 &&
+                    text.includes('(') &&
+                    /%\s*Course completed/i.test(text) &&
+                    text.length > 35 &&
+                    text.length < 900
+                ) {
+                    best = text;
+                    break;
+                }
+                node = node.parentElement;
+            }
+            if (best) return best;
+            node = start?.parentElement ?? null;
+            for (let depth = 0; depth < 8 && node; depth++) {
+                const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                if (text.includes('(') && text.includes(')') && text.length > 35 && text.length < 900) return text;
+                node = node.parentElement;
+            }
+            return '';
+        };
+
+        const pushCard = (
+            cardText: string,
+            titleFallback: string,
+            buttonIndex: number,
+            courseId: string,
+            href: string
+        ) => {
+            let title = '';
+            const titleMatch = cardText.match(/([\u1200-\u137F][\u1200-\u137F\s]*)\s*\(([^)]+)\)/);
+            if (titleMatch) {
+                title = `${titleMatch[1].trim()} (${titleMatch[2].trim()})`;
+            } else {
+                const eng = cardText.match(/\(([^)]+)\)/);
+                title = eng ? eng[0].replace(/^\(/, '').replace(/\)$/, '').trim() : '';
+                if (eng && cardText.includes('(')) {
+                    const am = cardText.split('(')[0].trim();
+                    if (am.length > 3) title = `${am} (${eng[1].trim()})`;
                 }
             }
-
-            const titleMatch = cardText.match(/([\u1200-\u137F][\u1200-\u137F\s]*)\s*\(([^)]+)\)/);
-            const title = titleMatch
-                ? `${titleMatch[1].trim()} (${titleMatch[2].trim()})`
-                : (cardText.match(/\(([^)]+)\)/)?.[0] ? cardText.slice(0, 120) : `Course ${index + 1}`);
-
+            if (!title || title.length < 5) title = titleFallback;
             const pctMatch = cardText.match(/(\d+)%\s*Course completed/i);
             const percent = pctMatch ? parseInt(pctMatch[1], 10) : 0;
-            const completed = percent >= 100 || /100%\s*Course completed/i.test(cardText);
+            const completed = percent >= 100;
+            results.push({
+                title,
+                percent,
+                completed,
+                index: results.length,
+                buttonIndex,
+                courseId,
+                href,
+            });
+        };
 
-            results.push({ title, percent, completed, index });
+        const titleFromCard = (btn: Element): string => {
+            const card = btn.closest('.card, article, [class*="course-card"], [class*="dashboard-card"], div');
+            if (!card) return '';
+            for (const sel of ['h3', 'h4', 'h5', '[class*="coursename"]', '[class*="course-title"]', 'a[href*="course/view"]']) {
+                const el = card.querySelector(sel);
+                const t = (el?.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t && /\(.+\)/.test(t) && t.length > 12 && t.length < 200) return t;
+            }
+            return '';
+        };
+
+        const viewButtons = [...document.querySelectorAll('a.view-course-btn, a[title="View Course"]')].filter((el) =>
+            /view course/i.test((el.textContent || '').trim()) || (el as HTMLAnchorElement).href?.includes('course/view')
+        );
+        if (!viewButtons.length) {
+            document.querySelectorAll('a, button').forEach((el) => {
+                if (/view course/i.test((el.textContent || '').trim())) viewButtons.push(el);
+            });
+        }
+        viewButtons.forEach((btn, buttonIndex) => {
+            const anchor = btn as HTMLAnchorElement;
+            const href = anchor.href || anchor.getAttribute('href') || '';
+            const idMatch = href.match(/[?&]id=(\d+)/);
+            const courseId = idMatch ? idMatch[1] : '';
+            const cardTitle = titleFromCard(btn);
+            const cardText = cardTitle || cardTextFromNode(btn);
+            pushCard(cardText, `Course ${buttonIndex + 1}`, buttonIndex, courseId, href);
         });
+
+        if (!results.length) {
+            document.querySelectorAll('a[href*="course/view"], a[href*="/course/"]').forEach((link, buttonIndex) => {
+                const cardText = cardTextFromNode(link);
+                if (cardText) {
+                    const href = (link as HTMLAnchorElement).href || '';
+                    const idMatch = href.match(/[?&]id=(\d+)/);
+                    pushCard(cardText, (link.textContent || '').trim().slice(0, 80) || `Course ${buttonIndex + 1}`, buttonIndex, idMatch?.[1] || '', href);
+                }
+            });
+        }
+
+        if (!results.length) {
+            document.querySelectorAll('[class*="course"], [data-region="course-content"], .card, article').forEach((el, i) => {
+                const cardText = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/%\s*Course completed/i.test(cardText) && !/\(\s*[A-Za-z]/.test(cardText)) return;
+                pushCard(cardText, `Course ${i + 1}`, i, '', '');
+            });
+        }
 
         return results;
     });
+}
+
+async function waitForCoursesGrid(page: any): Promise<CourseCardInfo[]> {
+    const selectors = [
+        'a:has-text("View Course")',
+        'button:has-text("View Course")',
+        'a[href*="course/view"]',
+        'text=Course completed',
+    ];
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+        if (attempt > 0) await safePageWait(page, 3500);
+
+        for (const sel of selectors) {
+            await page.locator(sel).first().waitFor({ state: 'visible', timeout: 6000 }).catch(() => {});
+        }
+
+        await page.evaluate(() => {
+            window.scrollTo(0, document.body.scrollHeight);
+        }).catch(() => {});
+        await safePageWait(page, 1200);
+        await page.evaluate(() => {
+            window.scrollTo(0, 0);
+        }).catch(() => {});
+        await safePageWait(page, 800);
+
+        const cards = await listCoursesOnPage(page);
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H2',
+            runId: 'pre-fix',
+            location: 'bot.ts:waitForCoursesGrid',
+            message: 'grid poll',
+            data: {
+                attempt,
+                cardCount: cards.length,
+                pageUrl: page.url(),
+                uniqueTitles: [...new Set(cards.map((c: CourseCardInfo) => c.title))].length,
+                titles: cards.map((c: CourseCardInfo) => ({ title: c.title, percent: c.percent, buttonIndex: c.buttonIndex })),
+            },
+        });
+        // #endregion
+        if (cards.length) return cards;
+    }
+
+    return [];
 }
 
 function courseMatchesPreference(cardTitle: string, preference: string): boolean {
@@ -662,34 +856,41 @@ function courseMatchesPreference(cardTitle: string, preference: string): boolean
 function pickRandomCourseCard(
     cards: CourseCardInfo[],
     student: any,
-    usedIndices: Set<number>
+    usedIndices: Set<number>,
+    studentOrdinal: number
 ): CourseCardInfo {
-    const incomplete = cards.filter((c) => !c.completed && c.percent < 100);
-    const pool = incomplete.length ? incomplete : cards;
+    const named = cards.filter((c) => !/^Course \d+$/i.test(c.title.trim()));
+    const incomplete = named.filter((c) => !c.completed && c.percent < 100);
+    const pool = incomplete.length ? incomplete : (named.length ? named : cards);
 
     let available = pool.filter((c) => !usedIndices.has(c.index));
-    if (!available.length) {
+    if (!available.length && pool.length > 1) {
         usedIndices.clear();
-        available = pool;
+        available = pool.filter((c) => !usedIndices.has(c.index));
     }
+    if (!available.length) available = pool;
 
     const username = (student.username || '').toString();
     const hash = username.split('').reduce((n, ch) => n + ch.charCodeAt(0), 0);
-    const start = hash % available.length;
-    const rotated = [...available.slice(start), ...available.slice(0, start)];
-    const jitter = Math.floor(Math.random() * rotated.length);
+    const pickSlot = (hash + studentOrdinal * 17) % available.length;
+    const rotated = [...available.slice(pickSlot), ...available.slice(0, pickSlot)];
+    const jitter = (hash + studentOrdinal) % rotated.length;
     const picked = rotated[jitter];
 
     usedIndices.add(picked.index);
     return picked;
 }
 
-async function openCourseFromGrid(page: any, student: any, usedIndices: Set<number>): Promise<string> {
-    await page.waitForSelector('text=View Course', { timeout: 20000 });
-    const cards = await listCoursesOnPage(page);
+async function openCourseFromGrid(
+    page: any,
+    student: any,
+    usedIndices: Set<number>,
+    studentOrdinal: number
+): Promise<string> {
+    const cards = await waitForCoursesGrid(page);
 
     // #region agent log
-    debugLog({ hypothesisId: 'H6', location: 'bot.ts:listCoursesOnPage', message: 'courses grid', data: { count: cards.length, cards } });
+    debugLog({ hypothesisId: 'H6', location: 'bot.ts:listCoursesOnPage', message: 'courses grid', data: { count: cards.length, cards, usedIndices: [...usedIndices] } });
     // #endregion
 
     if (!cards.length) {
@@ -698,44 +899,131 @@ async function openCourseFromGrid(page: any, student: any, usedIndices: Set<numb
     }
 
     const preference = (student.course || student.coursename || '').toString().trim();
-    let pickIndex = -1;
+    let picked: CourseCardInfo | null = null;
 
     if (preference) {
-        pickIndex = cards.findIndex((c) => courseMatchesPreference(c.title, preference));
-        if (pickIndex >= 0) console.log(`🎯 Matched CSV course preference: "${preference}"`);
+        picked = cards.find((c) => courseMatchesPreference(c.title, preference)) ?? null;
+        if (picked) console.log(`🎯 Matched CSV course preference: "${preference}"`);
     }
 
-    if (pickIndex < 0) {
-        const randomCard = pickRandomCourseCard(cards, student, usedIndices);
-        pickIndex = randomCard.index;
+    if (!picked) {
+        picked = pickRandomCourseCard(cards, student, usedIndices, studentOrdinal);
         const username = (student.username || student.firstname || 'student').toString();
-        console.log(`🎲 Random course for ${username}: ${randomCard.title}`);
+        console.log(`🎲 Random course for ${username}: ${picked.title}`);
         // #region agent log
         debugLog({
             hypothesisId: 'H6',
             location: 'bot.ts:openCourseFromGrid',
             message: 'random course pick',
             data: {
-                pickIndex,
+                studentOrdinal,
+                cardIndex: picked.index,
+                buttonIndex: picked.buttonIndex,
                 username,
-                title: randomCard.title,
-                usedCount: usedIndices.size,
-                pool: cards.filter((c) => !c.completed).map((c) => c.title),
+                title: picked.title,
+                usedIndices: [...usedIndices],
+                pool: cards.filter((c) => !c.completed).map((c) => ({ title: c.title, index: c.index })),
             },
         });
         // #endregion
     }
 
-    const picked = cards[pickIndex];
-    console.log(`📗 Opening [${pickIndex + 1}/${cards.length}]: ${picked.title} (${picked.percent}% done)`);
+    console.log(`📗 Opening [${picked.index + 1}/${cards.length}]: ${picked.title} (${picked.percent}% done)`);
 
-    const viewButtons = page.locator('a:has-text("View Course"), button:has-text("View Course")');
-    await viewButtons.nth(pickIndex).scrollIntoViewIfNeeded().catch(() => {});
-    await viewButtons.nth(pickIndex).click({ force: true, timeout: 20000 });
+    const urlBefore = page.url();
+    let viewBtn = picked.courseId
+        ? page.locator(`a.view-course-btn[href*="id=${picked.courseId}"]`).first()
+        : page.locator('a.view-course-btn').nth(picked.buttonIndex);
+    if ((await viewBtn.count().catch(() => 0)) === 0) {
+        viewBtn = page.locator('a:has-text("View Course")').nth(picked.buttonIndex);
+    }
+    const btnHref = picked.href || (await viewBtn.getAttribute('href').catch(() => null));
+    // #region agent log
+    debugLog({
+        hypothesisId: 'H1',
+        runId: 'post-fix',
+        location: 'bot.ts:openCourseFromGrid',
+        message: 'before view course click',
+        data: {
+            courseId: picked.courseId,
+            buttonIndex: picked.buttonIndex,
+            btnHref,
+            title: picked.title,
+            pageUrl: urlBefore,
+        },
+    });
+    // #endregion
 
-    await page.waitForTimeout(10000);
-    const h1Title = await page.locator('h1').first().innerText().catch(() => picked.title);
-    return h1Title || picked.title;
+    await viewBtn.scrollIntoViewIfNeeded().catch(() => {});
+    await page.evaluate((idx: number) => {
+        const buttons = [...document.querySelectorAll('a.view-course-btn')];
+        const el = buttons[idx] as HTMLElement | undefined;
+        el?.scrollIntoView({ block: 'center', inline: 'center' });
+    }, picked.buttonIndex).catch(() => {});
+    await safePageWait(page, 500);
+
+    let opened = false;
+    try {
+        await Promise.all([
+            page.waitForURL(/course\/view\.php/i, { timeout: 45000, waitUntil: 'commit' }),
+            viewBtn.click({ timeout: 20000 }),
+        ]);
+        opened = /course\/view\.php/i.test(page.url());
+    } catch {
+        await viewBtn.evaluate((el: HTMLAnchorElement) => el.click()).catch(() => {});
+        await page.waitForURL(/course\/view\.php/i, { timeout: 30000, waitUntil: 'commit' }).catch(() => {});
+        opened = /course\/view\.php/i.test(page.url());
+    }
+
+    if (!opened && btnHref) {
+        const targetUrl = btnHref.startsWith('http') ? btnHref : `https://learn.share.com.et${btnHref}`;
+        await page.goto(targetUrl, { waitUntil: 'commit', timeout: 60000 });
+        opened = /course\/view\.php/i.test(page.url());
+    }
+
+    // #region agent log
+    debugLog({
+        hypothesisId: 'H1',
+        runId: 'post-fix',
+        location: 'bot.ts:openCourseFromGrid',
+        message: 'after view course click',
+        data: {
+            method: 'view-course-btn',
+            courseId: picked.courseId,
+            btnHref,
+            urlBefore,
+            pageUrl: page.url(),
+            openedCourseView: opened,
+        },
+    });
+    // #endregion
+
+    if (!opened) {
+        throw new Error(`View Course click did not open course (still on ${page.url()})`);
+    }
+
+    if (/course\/view\.php/i.test(page.url()) && !/mod\/scorm/i.test(page.url())) {
+        const scormLink = page.locator('a[href*="mod/scorm/view"]').first();
+        if (await scormLink.isVisible({ timeout: 8000 }).catch(() => false)) {
+            await scormLink.click({ force: true, timeout: 15000, noWaitAfter: true });
+            await page.waitForURL(/mod\/scorm/i, { timeout: 60000 }).catch(() => {});
+            // #region agent log
+            debugLog({
+                hypothesisId: 'H1',
+                runId: 'post-fix',
+                location: 'bot.ts:openCourseFromGrid',
+                message: 'entered scorm from course view',
+                data: { pageUrl: page.url() },
+            });
+            // #endregion
+        }
+    }
+    await safePageWait(page, 5000);
+    const h1Title = await page.locator('h1').first().innerText().catch(() => '');
+    if (h1Title && normalizeText(h1Title) !== normalizeText(picked.title)) {
+        console.log(`📌 Grid title for answers: "${picked.title}" (page H1: "${h1Title.trim()}")`);
+    }
+    return picked.title;
 }
 
 // ====================== MAIN BOT ======================
@@ -758,14 +1046,16 @@ async function main() {
         .on('data', (row) => students.push(row))
         .on('end', async () => {
             const usedCourseIndices = new Set<number>();
+            let studentOrdinal = 0;
             for (const student of students) {
-                await processStudent(student, usedCourseIndices);
+                await processStudent(student, usedCourseIndices, studentOrdinal);
+                studentOrdinal++;
                 await new Promise(r => setTimeout(r, 15000));
             }
         });
 }
 
-async function processStudent(student: any, usedCourseIndices: Set<number>) {
+async function processStudent(student: any, usedCourseIndices: Set<number>, studentOrdinal: number) {
     if (!student.username) return;
 
     let username = student.username.toString().trim();
@@ -777,17 +1067,41 @@ async function processStudent(student: any, usedCourseIndices: Set<number>) {
     const page = await browser.newPage();
 
     try {
-        await page.goto('https://learn.share.com.et/login/index.php', { waitUntil: 'domcontentloaded' });
+        const tLogin = Date.now();
+        await page.goto('https://learn.share.com.et/login/index.php', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.fill('input[name="username"]', username);
         await page.fill('input[name="password"]', student.password || `${username}@R&D`);
-        await page.click('button[type="submit"]');
+        await page.click('button[type="submit"]', { noWaitAfter: true });
+        await page.waitForURL(/my\/courses|course\/view|dashboard|login\/index/i, { timeout: 45000 }).catch(() => {});
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H3',
+            runId: 'pre-fix',
+            location: 'bot.ts:processStudent',
+            message: 'after login click',
+            data: { username, ms: Date.now() - tLogin, pageUrl: page.url() },
+        });
+        // #endregion
 
-        await page.waitForTimeout(7000);
-        await page.goto('https://learn.share.com.et/my/courses.php', { waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(8000);
+        const tCourses = Date.now();
+        await page.goto('https://learn.share.com.et/my/courses.php', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        // #region agent log
+        debugLog({
+            hypothesisId: 'H3',
+            runId: 'pre-fix',
+            location: 'bot.ts:processStudent',
+            message: 'after courses goto',
+            data: { username, ms: Date.now() - tCourses, pageUrl: page.url() },
+        });
+        // #endregion
+        await safePageWait(page, 8000);
 
-        const courseTitle = await openCourseFromGrid(page, student, usedCourseIndices);
+        const courseTitle = await openCourseFromGrid(page, student, usedCourseIndices, studentOrdinal);
         console.log(`📘 Course: ${courseTitle}`);
+
+        if (/my\/courses\.php/i.test(page.url())) {
+            throw new Error('Still on My courses — View Course did not open the course');
+        }
 
         const answers = await loadAnswers(courseTitle);
         await startCourseProgress(page, answers);
@@ -811,7 +1125,7 @@ async function runChapterQuiz(
     console.log(`📋 Chapter test started (up to ${maxQuestions} questions)...`);
 
     for (let q = 0; q < maxQuestions; q++) {
-        await page.waitForTimeout(500);
+        await safePageWait(page, 500);
         const frame = getScormContentFrame(page);
         if (!frame || !(await isChapterQuizScreen(frame))) break;
 
@@ -832,7 +1146,7 @@ async function runChapterQuiz(
         idx++;
         answered++;
 
-        await page.waitForTimeout(400);
+        await safePageWait(page, 400);
         const submitted = await clickSubmitYasebu(page);
         // #region agent log
         debugLog({ hypothesisId: 'H4', location: 'bot.ts:runChapterQuiz', message: 'submit ያስገቡ', data: { q: q + 1, submitted } });
@@ -842,7 +1156,10 @@ async function runChapterQuiz(
             console.log('  ⚠️ ያስገቡ not found after answer');
             break;
         }
-        await page.waitForTimeout(700);
+        await safePageWait(page, 600);
+        const nextClicked = await clickNextBekuty(page);
+        debugLog({ hypothesisId: 'H4', location: 'bot.ts:runChapterQuiz', message: 'next ቀጣይ', data: { q: q + 1, nextClicked } });
+        await safePageWait(page, nextClicked ? 700 : 300);
     }
 
     if (answered > 0) {
