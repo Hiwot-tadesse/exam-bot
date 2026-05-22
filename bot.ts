@@ -206,7 +206,8 @@ function sortFramesByContent(frames: any[]): any[] {
 type ClickOpts = { examMode?: boolean; continueMode?: boolean };
 
 function getScormContentFrame(page: any) {
-    return sortFramesByContent(page.frames()).find((f: any) => /scormcontent/i.test(f.url())) || null;
+    const frames = sortFramesByContent(page.frames());
+    return frames.find((f: any) => /scormcontent|player/i.test(f.url())) || null;
 }
 
 type QuizStats = { radioCount: number; choiceCount: number; optionCount: number; hasNext: boolean };
