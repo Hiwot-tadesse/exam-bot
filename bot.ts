@@ -6,9 +6,10 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const BOT_VERSION = 'v8-fast-continue';
+const BOT_VERSION = 'v8-unique-random-course';
 const CONTINUE_POLL_MS = 350;
 const CONTINUE_POST_CLICK_MS = 1500;
+const CHAPTER_QUIZ_MAX_Q = 6;
 const DEBUG_LOG = path.join(__dirname, 'debug-93bca3.log');
 
 function debugLog(payload: Record<string, unknown>) {
@@ -218,7 +219,7 @@ async function getQuizStats(frame: any): Promise<QuizStats | null> {
             });
 
             const hasNext = [...document.querySelectorAll('button, a, [role="button"]')].some((el) =>
-                /ቀጣይ|Submit|Next|Check|Continue|SUBMIT/i.test((el.textContent || '').trim())
+                /ያስገቡ|ቀጣይ|Submit|Next|Check|Continue|SUBMIT/i.test((el.textContent || '').trim())
             );
 
             return {
@@ -234,16 +235,7 @@ async function getQuizStats(frame: any): Promise<QuizStats | null> {
 }
 
 async function isQuizScreen(frame: any): Promise<boolean> {
-    const stats = await getQuizStats(frame);
-    return !!stats && stats.optionCount >= 2 && stats.hasNext;
-}
-
-function isMidQuizOptions(n: number) {
-    return n >= 2 && n <= 6;
-}
-
-function isFinalQuizOptions(n: number) {
-    return n >= 8;
+    return isChapterQuizScreen(frame);
 }
 
 async function clickAnswerByLetter(frame: any, answer: string): Promise<boolean> {
@@ -303,28 +295,100 @@ async function clickAnswerByLetter(frame: any, answer: string): Promise<boolean>
     }
 }
 
-async function clickQuizNext(frame: any): Promise<boolean> {
+function answerLetterToIndex(answer: string): number {
+    const a = answer.trim();
+    if (['ለ', 'ሀ', 'A', 'a'].includes(a)) return 0;
+    if (['ሐ', 'U', 'B', 'b'].includes(a)) return 1;
+    if (['መ', 'ረ', 'C', 'c'].includes(a)) return 2;
+    return 0;
+}
+
+async function selectQuizAnswer(frame: any, answer: string): Promise<boolean> {
+    if (await clickAnswerByLetter(frame, answer)) return true;
+
+    const idx = answerLetterToIndex(answer);
     try {
-        const result = await frame.evaluate(() => {
-            const words = ['ቀጣይ', 'Submit', 'Next', 'Continue', 'SUBMIT', 'Check', 'Done', 'Finish'];
-            const nodes = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
-            for (const w of words) {
-                for (const el of nodes) {
-                    const t = (el.textContent || '').trim();
-                    if (!t.includes(w)) continue;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 8 && rect.height > 8) {
-                        (el as HTMLElement).click();
-                        return { ok: true, text: t.slice(0, 40) };
-                    }
-                }
+        const clicked = await frame.evaluate((choiceIdx) => {
+            const radios = [...document.querySelectorAll('input[type="radio"]')].filter((r) => {
+                const rect = r.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            });
+            if (radios.length >= 2 && choiceIdx < radios.length) {
+                const radio = radios[choiceIdx] as HTMLInputElement;
+                radio.click();
+                radio.closest('label')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                const row = radio.closest('[role="radio"], label, li, div');
+                (row as HTMLElement | null)?.click();
+                return true;
             }
-            return { ok: false };
-        });
-        return !!result?.ok;
+            const rows = [...document.querySelectorAll('[role="radio"], label')].filter((el) => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 20 && rect.height > 12;
+            });
+            if (rows.length >= 2 && choiceIdx < rows.length) {
+                (rows[choiceIdx] as HTMLElement).click();
+                return true;
+            }
+            return false;
+        }, idx);
+        if (clicked) return true;
+    } catch {}
+
+    try {
+        const radios = frame.locator('input[type="radio"]');
+        const count = await radios.count();
+        if (count >= 2) {
+            await radios.nth(Math.min(idx, count - 1)).click({ force: true, timeout: 8000 });
+            return true;
+        }
+    } catch {}
+
+    try {
+        const options = frame.locator('[role="radio"], label, div[tabindex="0"]');
+        const count = await options.count();
+        if (count >= 2) {
+            await options.nth(Math.min(idx, count - 1)).click({ force: true, timeout: 8000 });
+            return true;
+        }
+    } catch {}
+
+    return false;
+}
+
+async function clickSubmitYasebu(page: any): Promise<boolean> {
+    for (const frame of sortFramesByContent(page.frames())) {
+        try {
+            const exact = frame.getByRole('button', { name: 'ያስገቡ', exact: true });
+            if (await exact.isVisible({ timeout: 500 })) {
+                await exact.click({ force: true, timeout: 8000 });
+                debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickSubmitYasebu', message: 'clicked ያስገቡ', data: { frameUrl: frame.url(), method: 'role' } });
+                return true;
+            }
+        } catch {}
+        try {
+            const btn = frame.locator('button:has-text("ያስገቡ")').first();
+            if (await btn.isVisible({ timeout: 500 })) {
+                await btn.click({ force: true, timeout: 8000 });
+                debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickSubmitYasebu', message: 'clicked ያስገቡ', data: { frameUrl: frame.url(), method: 'has-text' } });
+                return true;
+            }
+        } catch {}
+    }
+    return false;
+}
+
+async function isChapterQuizScreen(frame: any): Promise<boolean> {
+    if (await isQuizScreen(frame)) return true;
+    try {
+        return await frame.locator('button:has-text("ያስገቡ")').first().isVisible({ timeout: 400 });
     } catch {
         return false;
     }
+}
+
+async function quizScreenActive(page: any): Promise<boolean> {
+    const frame = getScormContentFrame(page);
+    return frame ? await isChapterQuizScreen(frame) : false;
 }
 
 async function scanTextInFrames(page: any, text: string) {
@@ -526,6 +590,10 @@ async function waitAndClickContinue(page: any): Promise<{ clicked: boolean; fram
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (attempt > 0) await page.waitForTimeout(CONTINUE_POLL_MS);
 
+        if (await quizScreenActive(page)) {
+            continue;
+        }
+
         await autoSkipVideo(page);
 
         const result = await clickTextInFrames(page, ['መማር ይቀጥሉ'], { continueMode: true });
@@ -591,7 +659,32 @@ function courseMatchesPreference(cardTitle: string, preference: string): boolean
         || pref.split(' ').filter((w) => w.length > 3).every((w) => title.includes(w) || english.includes(w));
 }
 
-async function openCourseFromGrid(page: any, student: any): Promise<string> {
+function pickRandomCourseCard(
+    cards: CourseCardInfo[],
+    student: any,
+    usedIndices: Set<number>
+): CourseCardInfo {
+    const incomplete = cards.filter((c) => !c.completed && c.percent < 100);
+    const pool = incomplete.length ? incomplete : cards;
+
+    let available = pool.filter((c) => !usedIndices.has(c.index));
+    if (!available.length) {
+        usedIndices.clear();
+        available = pool;
+    }
+
+    const username = (student.username || '').toString();
+    const hash = username.split('').reduce((n, ch) => n + ch.charCodeAt(0), 0);
+    const start = hash % available.length;
+    const rotated = [...available.slice(start), ...available.slice(0, start)];
+    const jitter = Math.floor(Math.random() * rotated.length);
+    const picked = rotated[jitter];
+
+    usedIndices.add(picked.index);
+    return picked;
+}
+
+async function openCourseFromGrid(page: any, student: any, usedIndices: Set<number>): Promise<string> {
     await page.waitForSelector('text=View Course', { timeout: 20000 });
     const cards = await listCoursesOnPage(page);
 
@@ -613,17 +706,22 @@ async function openCourseFromGrid(page: any, student: any): Promise<string> {
     }
 
     if (pickIndex < 0) {
-        const incomplete = cards.filter((c) => !c.completed && c.percent < 100);
-        const pool = incomplete.length ? incomplete : cards;
-        const randomCard = pool[Math.floor(Math.random() * pool.length)];
+        const randomCard = pickRandomCourseCard(cards, student, usedIndices);
         pickIndex = randomCard.index;
-        console.log(`🎲 Random course (${pool.length} available): ${randomCard.title}`);
+        const username = (student.username || student.firstname || 'student').toString();
+        console.log(`🎲 Random course for ${username}: ${randomCard.title}`);
         // #region agent log
         debugLog({
             hypothesisId: 'H6',
             location: 'bot.ts:openCourseFromGrid',
             message: 'random course pick',
-            data: { pickIndex, title: randomCard.title, poolSize: pool.length, pool: pool.map((c) => c.title) },
+            data: {
+                pickIndex,
+                username,
+                title: randomCard.title,
+                usedCount: usedIndices.size,
+                pool: cards.filter((c) => !c.completed).map((c) => c.title),
+            },
         });
         // #endregion
     }
@@ -659,14 +757,15 @@ async function main() {
         .pipe(csv())
         .on('data', (row) => students.push(row))
         .on('end', async () => {
+            const usedCourseIndices = new Set<number>();
             for (const student of students) {
-                await processStudent(student);
+                await processStudent(student, usedCourseIndices);
                 await new Promise(r => setTimeout(r, 15000));
             }
         });
 }
 
-async function processStudent(student: any) {
+async function processStudent(student: any, usedCourseIndices: Set<number>) {
     if (!student.username) return;
 
     let username = student.username.toString().trim();
@@ -687,7 +786,7 @@ async function processStudent(student: any) {
         await page.goto('https://learn.share.com.et/my/courses.php', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(8000);
 
-        const courseTitle = await openCourseFromGrid(page, student);
+        const courseTitle = await openCourseFromGrid(page, student, usedCourseIndices);
         console.log(`📘 Course: ${courseTitle}`);
 
         const answers = await loadAnswers(courseTitle);
@@ -700,39 +799,64 @@ async function processStudent(student: any) {
     }
 }
 
-async function handleMidCourseQuiz(page: any, answers: string[], answerIndex: number): Promise<number> {
+async function runChapterQuiz(
+    page: any,
+    answers: string[],
+    answerIndex: number,
+    maxQuestions: number = CHAPTER_QUIZ_MAX_Q
+): Promise<number> {
     let idx = answerIndex;
     let answered = 0;
 
-    for (let step = 0; step < 5; step++) {
+    console.log(`📋 Chapter test started (up to ${maxQuestions} questions)...`);
+
+    for (let q = 0; q < maxQuestions; q++) {
+        await page.waitForTimeout(500);
         const frame = getScormContentFrame(page);
-        if (!frame || !(await isQuizScreen(frame))) break;
+        if (!frame || !(await isChapterQuizScreen(frame))) break;
 
         const answer = answers[idx] ?? answers[idx % Math.max(answers.length, 1)] ?? 'ለ';
-        const ok = await clickAnswerByLetter(frame, answer);
+        const selected = await selectQuizAnswer(frame, answer);
         // #region agent log
         debugLog({
             hypothesisId: 'H4',
-            location: 'bot.ts:handleMidCourseQuiz',
-            message: 'mid-course quiz answer',
-            data: { step, qIndex: idx + 1, answer, ok, frameUrl: frame.url() },
+            location: 'bot.ts:runChapterQuiz',
+            message: 'chapter quiz answer',
+            data: { q: q + 1, qIndex: idx + 1, answer, selected, frameUrl: frame.url() },
         });
         // #endregion
 
-        if (!ok) break;
+        if (!selected) break;
 
-        console.log(`  📝 Quiz Q${idx + 1} → ${answer} ✓`);
+        console.log(`  📝 Q${q + 1} → ${answer} ✓`);
         idx++;
         answered++;
-        await page.waitForTimeout(1200);
-        await clickQuizNext(frame);
-        await page.waitForTimeout(1500);
+
+        await page.waitForTimeout(400);
+        const submitted = await clickSubmitYasebu(page);
+        // #region agent log
+        debugLog({ hypothesisId: 'H4', location: 'bot.ts:runChapterQuiz', message: 'submit ያስገቡ', data: { q: q + 1, submitted } });
+        // #endregion
+
+        if (!submitted) {
+            console.log('  ⚠️ ያስገቡ not found after answer');
+            break;
+        }
+        await page.waitForTimeout(700);
     }
 
     if (answered > 0) {
-        console.log(`✅ Mid-course quiz: ${answered} question(s) answered`);
-        await waitAndClickContinue(page);
-        await page.waitForTimeout(CONTINUE_POST_CLICK_MS);
+        console.log(`✅ Chapter test done (${answered} questions) — looking for መማር ይቀጥሉ...`);
+        for (let i = 0; i < 25; i++) {
+            await page.waitForTimeout(CONTINUE_POLL_MS);
+            if (await quizScreenActive(page)) continue;
+            const cont = await waitAndClickContinue(page);
+            if (cont.clicked) {
+                console.log('✅ መማር ይቀጥሉ after chapter test');
+                await page.waitForTimeout(CONTINUE_POST_CLICK_MS);
+                break;
+            }
+        }
     }
 
     return idx;
@@ -750,7 +874,7 @@ async function startCourseProgress(page: any, answers: string[] = []) {
         const pageUrl = page.url();
         const scorm = getScormContentFrame(page);
         const quizStats = scorm ? await getQuizStats(scorm) : null;
-        const quizActive = quizStats ? isMidQuizOptions(quizStats.optionCount) && quizStats.hasNext : false;
+        const quizActive = scorm ? await isChapterQuizScreen(scorm) : false;
 
         // #region agent log
         debugLog({
@@ -767,9 +891,9 @@ async function startCourseProgress(page: any, answers: string[] = []) {
         }
 
         if (quizActive) {
-            console.log(`🔄 Loop ${loop} - Mid-course quiz detected...`);
+            console.log(`🔄 Loop ${loop} - Chapter quiz detected...`);
             const before = answerIndex;
-            answerIndex = await handleMidCourseQuiz(page, answers, answerIndex);
+            answerIndex = await runChapterQuiz(page, answers, answerIndex);
             if (answerIndex > before) continue;
         }
 
@@ -790,9 +914,9 @@ async function startCourseProgress(page: any, answers: string[] = []) {
             debugLog({ hypothesisId: 'H4', location: 'bot.ts:noContinue', message: 'continue missing', data: { loop, stats2 } });
             // #endregion
 
-            if (scorm2 && stats2 && isMidQuizOptions(stats2.optionCount)) {
-                console.log(`🔄 Loop ${loop} - Quiz screen (${stats2.optionCount} options)...`);
-                answerIndex = await handleMidCourseQuiz(page, answers, answerIndex);
+            if (scorm2 && (await isChapterQuizScreen(scorm2))) {
+                console.log(`🔄 Loop ${loop} - Chapter quiz (${stats2?.optionCount ?? '?'} options)...`);
+                answerIndex = await runChapterQuiz(page, answers, answerIndex);
                 continue;
             }
 
@@ -808,16 +932,9 @@ async function startCourseProgress(page: any, answers: string[] = []) {
                 const stats3 = scorm3 ? await getQuizStats(scorm3) : null;
                 debugLog({ hypothesisId: 'H3', location: 'bot.ts:postExamStart', message: 'quiz stats after exam start', data: { stats3 } });
 
-                if (stats3 && isFinalQuizOptions(stats3.optionCount)) {
-                    console.log(`📝 FINAL exam (${stats3.optionCount} options visible)`);
-                    await takeQuiz(page, answers, { maxQuestions: 14, startIndex: answerIndex, label: 'Final exam' });
-                    break;
-                }
-                if (stats3 && isMidQuizOptions(stats3.optionCount)) {
-                    console.log(`📝 Mid-quiz after exam-like screen (${stats3.optionCount} options)`);
-                    answerIndex = await handleMidCourseQuiz(page, answers, answerIndex);
-                    continue;
-                }
+                console.log('📝 FINAL exam (ፈተናውን ይጀምሩ clicked) — up to 14 questions');
+                await takeQuiz(page, answers, { maxQuestions: 14, startIndex: answerIndex, label: 'Final exam' });
+                break;
             }
             await page.screenshot({ path: `debug-no-btn-${loop}.png` }).catch(() => {});
         }
@@ -864,7 +981,7 @@ async function takeQuiz(
 
         const stats = await getQuizStats(frame);
         const answer = answers[idx] ?? answers[idx % Math.max(answers.length, 1)] ?? 'ለ';
-        const ok = await clickAnswerByLetter(frame, answer);
+        const ok = await selectQuizAnswer(frame, answer);
         // #region agent log
         debugLog({
             hypothesisId: 'H3',
@@ -878,12 +995,14 @@ async function takeQuiz(
         if (!ok) break;
 
         idx++;
-        await page.waitForTimeout(2500);
-        await clickQuizNext(frame);
-        await page.waitForTimeout(3500);
+        await page.waitForTimeout(400);
+        await clickSubmitYasebu(page);
+        await page.waitForTimeout(700);
     }
 
-    await waitAndClickContinue(page);
+    if (!(await quizScreenActive(page))) {
+        await waitAndClickContinue(page);
+    }
     console.log(`✅ ${opts.label} completed`);
 }
 
