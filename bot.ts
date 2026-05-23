@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const BOT_VERSION = 'v17-nine-steps';
+const BOT_VERSION = 'v18-exam-visible';
 
 /** 9-step workflow (see processStudent + runCourseFlow). */
 function stepLog(step: number, message: string): void {
@@ -16,21 +16,92 @@ const CONTINUE_POLL_MS = 350;
 const CONTINUE_POST_CLICK_MS = 1500;
 const CHAPTER_QUIZ_MAX_Q = 6;
 const DEBUG_LOG = path.join(__dirname, 'debug-93bca3.log');
+const DEBUG_SESSION_LOG = path.join(__dirname, 'debug-6829b8.log');
+const DEBUG_SESSION_ID = '6829b8';
 
 function debugLog(payload: Record<string, unknown>) {
-    const line = JSON.stringify({ sessionId: '93bca3', timestamp: Date.now(), ...payload }) + '\n';
+    const line = JSON.stringify({ sessionId: DEBUG_SESSION_ID, timestamp: Date.now(), ...payload }) + '\n';
     for (const logPath of [
+        DEBUG_SESSION_LOG,
         DEBUG_LOG,
+        path.join(process.cwd(), 'debug-6829b8.log'),
         path.join(process.cwd(), 'debug-93bca3.log'),
-        path.join(__dirname, '.cursor', 'debug-93bca3.log'),
+        path.join(__dirname, '.cursor', 'debug-6829b8.log'),
     ]) {
         try { fs.appendFileSync(logPath, line); } catch {}
     }
     fetch('http://127.0.0.1:7785/ingest/033e1045-1a8d-439a-aec7-78fd76285c5f', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '93bca3' },
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': DEBUG_SESSION_ID },
         body: line.trim(),
     }).catch(() => {});
+}
+
+/** Runtime probe when stuck — tests H1–H5 (frames, sidebar, video, continue/exam counts). */
+async function debugProbePageState(page: any, loop: number, continueResult: { method: string }) {
+    const frameUrls = page.frames().map((f: any) => f.url());
+    const scormUrl = getScormContentFrame(page)?.url() || null;
+    const perFrame: Record<string, unknown>[] = [];
+
+    for (const frame of page.frames()) {
+        try {
+            const stats = await frame.evaluate(() => {
+                const isVis = (el: Element) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 8 && r.height > 5 && r.bottom > 0 && r.top < window.innerHeight;
+                };
+                const countText = (needle: string) => {
+                    let total = 0;
+                    let visible = 0;
+                    document.querySelectorAll('button, a, span, p, div, label, li').forEach((el) => {
+                        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (!t.includes(needle)) return;
+                        total++;
+                        if (isVis(el)) visible++;
+                    });
+                    return { total, visible };
+                };
+                const sidebarQuiz = [...document.querySelectorAll('a, button, li, div, span')].filter((el) => {
+                    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    return /ጥያቄ|ማጠቃለያ|ፈተና/.test(t) && t.length < 120;
+                }).map((el) => ({
+                    tag: el.tagName,
+                    text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+                    visible: isVis(el),
+                }));
+
+                return {
+                    continueBtn: countText('መማር ይቀጥሉ'),
+                    examBtn: countText('ፈተና'),
+                    videoTags: document.querySelectorAll('video').length,
+                    youtubeIframes: document.querySelectorAll('iframe[src*="youtube"], iframe[src*="youtu.be"]').length,
+                    bodyTextLen: (document.body?.innerText || '').length,
+                    sidebarQuizItems: sidebarQuiz.slice(0, 8),
+                };
+            });
+            perFrame.push({ frameUrl: frame.url(), ...stats });
+        } catch (e: any) {
+            perFrame.push({ frameUrl: frame.url(), error: e?.message || 'evaluate-failed' });
+        }
+    }
+
+    // #region agent log
+    debugLog({
+        runId: 'stuck-probe',
+        hypothesisId: 'H1-H5',
+        location: 'bot.ts:debugProbePageState',
+        message: 'stuck page state',
+        data: {
+            loop,
+            pageUrl: page.url(),
+            scormUrl,
+            continueMethod: continueResult.method,
+            frameCount: frameUrls.length,
+            frameUrls: frameUrls.map((u: string) => u.slice(0, 120)),
+            perFrame,
+        },
+    });
+    // #endregion
 }
 
 async function safePageWait(page: any, ms: number): Promise<void> {
@@ -207,7 +278,20 @@ type ClickOpts = { examMode?: boolean; continueMode?: boolean };
 
 function getScormContentFrame(page: any) {
     const frames = sortFramesByContent(page.frames());
-    return frames.find((f: any) => /scormcontent|player/i.test(f.url())) || null;
+    return frames.find((f: any) => /scormcontent/i.test(f.url())) || null;
+}
+
+async function waitForScormContentFrame(page: any, maxMs = 20000): Promise<any> {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+        const frame = getScormContentFrame(page);
+        if (frame) return frame;
+        if (/view\.php/i.test(page.url())) {
+            await launchScormFromView(page);
+        }
+        await safePageWait(page, 500);
+    }
+    return null;
 }
 
 type QuizStats = { radioCount: number; choiceCount: number; optionCount: number; hasNext: boolean };
@@ -253,15 +337,48 @@ async function getQuizStats(frame: any): Promise<QuizStats | null> {
     }
 }
 
-/** Single quiz detector — no mutual recursion with isChapterQuizScreen */
+/** Single quiz detector — ignore hidden Storyline slides (viewport + visible submit). */
 async function detectQuizScreen(frame: any): Promise<boolean> {
+    try {
+        const active = await frame.evaluate(() => {
+            const isVisibleInViewport = (el: Element) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 8 || rect.height < 8) return false;
+                if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                let node: Element | null = el;
+                while (node && node !== document.documentElement) {
+                    const st = getComputedStyle(node);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    if (parseFloat(st.opacity) < 0.2) return false;
+                    const h = node as HTMLElement;
+                    if (h.offsetParent === null && st.position !== 'fixed' && node.tagName !== 'BODY' && node.tagName !== 'HTML') {
+                        return false;
+                    }
+                    node = node.parentElement;
+                }
+                return true;
+            };
+
+            const hasSubmit = [...document.querySelectorAll('button, a, [role="button"]')].some((el) => {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                return /ያስገቡ/i.test(t) && isVisibleInViewport(el);
+            });
+            if (!hasSubmit) return false;
+
+            let visRadios = 0;
+            document.querySelectorAll('input[type="radio"]').forEach((r) => {
+                if (isVisibleInViewport(r)) visRadios++;
+            });
+            return visRadios >= 2;
+        });
+        if (active) return true;
+    } catch {}
+
     const stats = await getQuizStats(frame);
-    if (stats && (stats.optionCount >= 2 || stats.radioCount >= 2)) return true;
+    if (stats && stats.hasNext && (stats.optionCount >= 2 || stats.radioCount >= 2)) return true;
     try {
         if (await frame.locator('button:has-text("ያስገቡ")').first().isVisible({ timeout: 400 })) return true;
-    } catch {}
-    try {
-        if ((await frame.locator('input[type="radio"]').count()) >= 2) return true;
     } catch {}
     return false;
 }
@@ -460,15 +577,23 @@ async function scanTextInFrames(page: any, text: string) {
             const stats = await frame.evaluate((searchText) => {
                 let matchCount = 0;
                 let visibleCount = 0;
+                const isViewportVisible = (el: Element) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    if (rect.width < 8 || rect.height < 5) return false;
+                    if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                    if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    if (parseFloat(style.opacity) < 0.2) return false;
+                    const h = el as HTMLElement;
+                    if (h.offsetParent === null && style.position !== 'fixed' && el.tagName !== 'BODY') return false;
+                    return true;
+                };
                 document.querySelectorAll('button, a, [role="button"], div, span, p, label').forEach((el) => {
                     const t = (el.textContent || '').trim();
                     if (!t.includes(searchText)) return;
                     matchCount++;
-                    const rect = el.getBoundingClientRect();
-                    const style = getComputedStyle(el);
-                    if (rect.width > 5 && rect.height > 5 && style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0.1) {
-                        visibleCount++;
-                    }
+                    if (isViewportVisible(el)) visibleCount++;
                 });
                 return { matchCount, visibleCount };
             }, text);
@@ -510,6 +635,12 @@ async function findBestClickTarget(frame: any, text: string, opts?: ClickOpts) {
                 if (rect.width < 8 || rect.height < 8) continue;
                 if (style.display === 'none' || style.visibility === 'hidden') continue;
                 if (parseFloat(style.opacity) < 0.1) continue;
+                if (examMode) {
+                    if (rect.bottom < 2 || rect.top > window.innerHeight - 2) continue;
+                    if (rect.right < 2 || rect.left > window.innerWidth - 2) continue;
+                    const h = el as HTMLElement;
+                    if (h.offsetParent === null && style.position !== 'fixed' && el.tagName !== 'BODY') continue;
+                }
                 const area = rect.width * rect.height;
                 if (area > 250000) continue;
                 if (!best || area < best.area) {
@@ -1699,6 +1830,7 @@ async function runCourseFlow(page: any, answers: string[] = []) {
     let answerIndex = 0;
 
     await launchScormFromView(page);
+    await waitForScormContentFrame(page, 25000);
 
     stepLog(3, 'Click መማር ይቀጥሉ once to start course (if visible)');
     await clickContinueOnce(page, 'Start course');
@@ -1719,29 +1851,42 @@ async function runCourseFlow(page: any, answers: string[] = []) {
 
         if (await isMoodleErrorPage(page)) {
             await launchScormFromView(page);
-        } else if (/view\.php/i.test(page.url()) && !getScormContentFrame(page)) {
+        } else if (/view\.php/i.test(page.url()) || !getScormContentFrame(page)) {
             await launchScormFromView(page);
+            await waitForScormContentFrame(page, 15000);
         }
 
-        const scorm = getScormContentFrame(page);
-        const inQuiz = scorm ? await isQuizScreen(scorm) : false;
-
-        // Step 5 + 6 + 7: exam (ፈተናውን ይጀምሩ)
-        if (!inQuiz && (await findExamStartButton(page))) {
+        // Step 5 + 6 + 7: exam (ፈተናውን ይጀምሩ) — check before quiz (summary page has no active quiz)
+        const examVisible = await findExamStartButton(page);
+        if (examVisible) {
             stepLog(5, 'Click ፈተናውን ይጀምሩ → start exam');
             const examResult = await clickExamStartButton(page);
+            debugLog({
+                hypothesisId: 'H3',
+                location: 'bot.ts:examCheck',
+                message: 'exam click attempt',
+                data: { loop, clicked: examResult.clicked, frameUrl: examResult.frameUrl, method: examResult.method },
+            });
             if (examResult.clicked) {
-                await safePageWait(page, 2000);
+                await safePageWait(page, 2500);
+                await waitForScormContentFrame(page, 12000);
                 if (await waitForQuizAfterExamStart(page)) {
                     stepLog(6, 'Answer all questions (answer → ያስገቡ → ይቀጥሉ) from answers CSV');
                     answerIndex = await runQuizBlock(page, answers, answerIndex, 50, 'Final exam');
                     stepLog(7, 'After test → click መማር ይቀጥሉ');
                     await clickContinueOnce(page, 'After exam');
+                    await waitForScormContentFrame(page, 10000);
                     if (await isCourseCertified(page)) continue;
                     continue;
                 }
+                console.log('   ⚠️ Exam started but quiz UI not detected yet — continuing loop');
+            } else {
+                console.log('   ⚠️ ፈተናውን ይጀምሩ visible on screen but click failed — will retry');
             }
         }
+
+        const scorm = getScormContentFrame(page);
+        const inQuiz = scorm ? await isQuizScreen(scorm) : false;
 
         // Mid-course quiz (steps 4–6, smaller tests)
         if (scorm && inQuiz) {
@@ -1751,6 +1896,9 @@ async function runCourseFlow(page: any, answers: string[] = []) {
             if (answerIndex > before) {
                 stepLog(7, 'After quiz → መማር ይቀጥሉ');
                 await clickContinueOnce(page, 'After chapter test');
+                if (await waitForExamStartButton(page, 12000)) {
+                    console.log('   📋 Chapter summary ready — ፈተናውን ይጀምሩ detected');
+                }
                 continue;
             }
         }
@@ -1758,12 +1906,25 @@ async function runCourseFlow(page: any, answers: string[] = []) {
         // Step 4: skip videos + መማር ይቀጥሉ until ፈተናውን ይጀምሩ
         console.log(`   Step 4 (loop ${loop}): skip video + መማር ይቀጥሉ...`);
         await autoSkipVideo(page);
-        const continued = await clickContinueOnce(page, 'Continue lesson');
+        const continueResult = await waitAndClickContinue(page);
+        const continued = continueResult.clicked;
+        if (continued) {
+            console.log(`   ✅ Continue lesson — መማር ይቀጥሉ (${continueResult.method})`);
+            await safePageWait(page, CONTINUE_POST_CLICK_MS);
+        }
 
-        if (!continued && !(await findExamStartButton(page)) && !inQuiz) {
+        const examNow = await findExamStartButton(page);
+        const quizNow = scorm ? await isQuizScreen(scorm) : false;
+
+        if (!continued && !examNow && !quizNow) {
+            if (loop <= 3 || loop % 4 === 0) {
+                await debugProbePageState(page, loop, continueResult);
+            }
             if (loop % 8 === 0) {
                 await launchScormFromView(page);
+                await waitForScormContentFrame(page, 12000);
                 await page.screenshot({ path: `debug-stuck-${loop}.png` }).catch(() => {});
+                console.log(`   ⚠️ Stuck at loop ${loop} — no continue, no exam, no quiz (see debug-stuck-${loop}.png)`);
             }
         }
     }
@@ -1810,6 +1971,19 @@ async function isCourseCertified(page: any): Promise<boolean> {
 
 const EXAM_START_TEXTS = ['ፈተናውን ይጀምሩ', 'ፈተና ይጀምሩ'];
 
+async function waitForExamStartButton(page: any, maxMs = 12000): Promise<boolean> {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+        if (await findExamStartButton(page)) return true;
+        if (await page.locator('text=Your content is loading').isVisible({ timeout: 400 }).catch(() => false)) {
+            await safePageWait(page, 1500);
+            continue;
+        }
+        await safePageWait(page, 500);
+    }
+    return false;
+}
+
 function orderFramesForScorm(page: any): any[] {
     const frames = page.frames();
     const scormContent = frames.filter((f: any) => /scormcontent/i.test(f.url()));
@@ -1820,16 +1994,33 @@ function orderFramesForScorm(page: any): any[] {
 
 async function findExamStartButton(page: any): Promise<boolean> {
     for (const frame of orderFramesForScorm(page)) {
+        if (!/scormcontent/i.test(frame.url())) continue;
         try {
             const found = await frame.evaluate(() => {
                 const needles = ['ፈተናውን ይጀምሩ', 'ፈተና ይጀምሩ'];
-                const nodes = [...document.querySelectorAll('a, button, span, p, div, label')];
+                const isVisibleInViewport = (el: Element) => {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 12 || rect.height < 5) return false;
+                    if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                    if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                    let node: Element | null = el;
+                    while (node && node !== document.documentElement) {
+                        const st = getComputedStyle(node);
+                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        if (parseFloat(st.opacity) < 0.2) return false;
+                        const h = node as HTMLElement;
+                        if (h.offsetParent === null && st.position !== 'fixed' && node.tagName !== 'BODY' && node.tagName !== 'HTML') {
+                            return false;
+                        }
+                        node = node.parentElement;
+                    }
+                    return true;
+                };
+                const nodes = [...document.querySelectorAll('a, button, span, p, div, label, [role="button"], [role="link"]')];
                 return nodes.some((el) => {
                     const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-                    if (!needles.some((n) => t.includes(n)) || t.length > 50) return false;
-                    const rect = el.getBoundingClientRect();
-                    const st = getComputedStyle(el);
-                    return rect.width > 15 && rect.height > 6 && st.display !== 'none' && st.visibility !== 'hidden';
+                    if (!needles.some((n) => t.includes(n)) || t.length > 55) return false;
+                    return isVisibleInViewport(el);
                 });
             });
             if (found) return true;
@@ -1838,29 +2029,25 @@ async function findExamStartButton(page: any): Promise<boolean> {
     return false;
 }
 
-/** Click green "ፈተናውን ይጀምሩ >" link inside SCORM (span/div, not always a button). */
+/** Click green "ፈተናውን ይጀምሩ >" link inside SCORM — only the viewport-visible slide (not hidden Storyline layers). */
 async function clickExamStartButton(page: any): Promise<{ clicked: boolean; frameUrl: string; method: string }> {
     for (const frame of orderFramesForScorm(page)) {
+        if (!/scormcontent/i.test(frame.url())) continue;
         const frameUrl = frame.url();
 
         for (const text of EXAM_START_TEXTS) {
             try {
-                const loc = frame.getByText(text, { exact: false }).first();
-                if (await loc.isVisible({ timeout: 1200 })) {
-                    await loc.scrollIntoViewIfNeeded().catch(() => {});
-                    await loc.click({ force: true, timeout: 12000 });
-                    console.log(`✅ Clicked ፈተናውን ይጀምሩ via getByText in ${frameUrl}`);
-                    return { clicked: true, frameUrl, method: 'getByText' };
-                }
-            } catch {}
-
-            try {
-                const loc = frame.locator(`text=${text}`).first();
-                if (await loc.isVisible({ timeout: 1200 })) {
-                    await loc.scrollIntoViewIfNeeded().catch(() => {});
-                    await loc.click({ force: true, timeout: 12000 });
-                    console.log(`✅ Clicked ፈተናውን ይጀምሩ via text= in ${frameUrl}`);
-                    return { clicked: true, frameUrl, method: 'text-locator' };
+                const loc = frame.getByText(text, { exact: false });
+                const count = await loc.count();
+                for (let i = 0; i < count; i++) {
+                    const el = loc.nth(i);
+                    if (!(await el.isVisible({ timeout: 800 }).catch(() => false))) continue;
+                    const box = await el.boundingBox().catch(() => null);
+                    if (!box || box.width < 12 || box.height < 5) continue;
+                    await el.scrollIntoViewIfNeeded().catch(() => {});
+                    await el.click({ force: true, timeout: 12000 });
+                    console.log(`✅ Clicked ፈተናውን ይጀምሩ via getByText[${i}] in ${frameUrl}`);
+                    return { clicked: true, frameUrl, method: `getByText:${i}` };
                 }
             } catch {}
         }
@@ -1868,36 +2055,58 @@ async function clickExamStartButton(page: any): Promise<{ clicked: boolean; fram
         try {
             const target = await frame.evaluate(() => {
                 const needles = ['ፈተናውን ይጀምሩ', 'ፈተና ይጀምሩ'];
+                const isVisibleInViewport = (el: Element) => {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 12 || rect.height < 5) return false;
+                    if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                    if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                    let node: Element | null = el;
+                    while (node && node !== document.documentElement) {
+                        const st = getComputedStyle(node);
+                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        if (parseFloat(st.opacity) < 0.2) return false;
+                        const h = node as HTMLElement;
+                        if (h.offsetParent === null && st.position !== 'fixed' && node.tagName !== 'BODY' && node.tagName !== 'HTML') {
+                            return false;
+                        }
+                        node = node.parentElement;
+                    }
+                    return true;
+                };
+
                 const nodes = [...document.querySelectorAll('a, button, span, p, div, label, [role="button"], [role="link"]')];
-                let best: { x: number; y: number; tag: string; text: string; area: number } | null = null;
+                let bestEl: HTMLElement | null = null;
+                let bestScore = -1;
                 for (const el of nodes) {
                     const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-                    if (!needles.some((n) => t.includes(n)) || t.length > 50) continue;
+                    if (!needles.some((n) => t.includes(n)) || t.length > 55) continue;
+                    if (!isVisibleInViewport(el)) continue;
+
+                    let score = 100;
+                    if (el.tagName === 'A') score += 40;
+                    const anchor = el.closest('a') as HTMLElement | null;
+                    if (anchor && anchor !== el && isVisibleInViewport(anchor)) score += 25;
+                    const color = getComputedStyle(el).color;
+                    if (/rgb\(\s*0\s*,\s*166\s*,\s*81|#00a651/i.test(color)) score += 50;
                     const rect = el.getBoundingClientRect();
-                    const st = getComputedStyle(el);
-                    if (rect.width < 15 || rect.height < 6) continue;
-                    if (st.display === 'none' || st.visibility === 'hidden') continue;
-                    const area = rect.width * rect.height;
-                    if (!best || area < best.area) {
-                        best = {
-                            x: rect.left + rect.width / 2,
-                            y: rect.top + rect.height / 2,
-                            tag: el.tagName,
-                            text: t.slice(0, 60),
-                            area,
-                        };
+                    score -= (rect.width * rect.height) / 8000;
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestEl = (anchor && isVisibleInViewport(anchor) ? anchor : el) as HTMLElement;
                     }
                 }
-                if (!best) return null;
-                const el = document.elementFromPoint(best.x, best.y) as HTMLElement | null;
-                (el || document.body).dispatchEvent(new Event('scroll'));
-                const clickEl = [...document.querySelectorAll('a, button, span, p, div')].find((n) => {
-                    const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
-                    return needles.some((nd) => t.includes(nd)) && t.length < 50;
-                }) as HTMLElement | undefined;
-                clickEl?.scrollIntoView({ block: 'center', inline: 'center' });
-                clickEl?.click();
-                return best;
+                if (!bestEl) return null;
+
+                bestEl.scrollIntoView({ block: 'center', inline: 'center' });
+                bestEl.click();
+                const rect = bestEl.getBoundingClientRect();
+                return {
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    tag: bestEl.tagName,
+                    text: (bestEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+                };
             });
             if (target) {
                 try {
@@ -1927,6 +2136,33 @@ async function waitForQuizAfterExamStart(page: any, maxWaitMs = 15000): Promise<
 }
 
 async function autoSkipVideo(page: any) {
+    let mainVideos = 0;
+    try {
+        mainVideos = await page.evaluate(() => document.querySelectorAll('video').length);
+    } catch {}
+    let frameVideos = 0;
+    let ytIframes = 0;
+    for (const frame of page.frames()) {
+        try {
+            const c = await frame.evaluate(() => ({
+                videos: document.querySelectorAll('video').length,
+                yt: document.querySelectorAll('iframe[src*="youtube"], iframe[src*="youtu.be"]').length,
+            }));
+            frameVideos += c.videos;
+            ytIframes += c.yt;
+        } catch {}
+    }
+    // #region agent log
+    if (frameVideos === 0 && ytIframes > 0) {
+        debugLog({
+            runId: 'stuck-probe',
+            hypothesisId: 'H2',
+            location: 'bot.ts:autoSkipVideo',
+            message: 'youtube iframe only — cannot skip via video tag',
+            data: { mainVideos, frameVideos, ytIframes },
+        });
+    }
+    // #endregion
     await page.evaluate(() => {
         document.querySelectorAll('video').forEach((v: any) => {
             v.muted = true;
@@ -1934,6 +2170,17 @@ async function autoSkipVideo(page: any) {
             if (v.duration) v.currentTime = v.duration - 5;
         });
     });
+    for (const frame of page.frames()) {
+        try {
+            await frame.evaluate(() => {
+                document.querySelectorAll('video').forEach((v: any) => {
+                    v.muted = true;
+                    v.playbackRate = 16;
+                    if (v.duration) v.currentTime = v.duration - 5;
+                });
+            });
+        } catch {}
+    }
 }
 
 main().catch(console.error);
