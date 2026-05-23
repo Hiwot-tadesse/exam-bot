@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const BOT_VERSION = 'v18-exam-visible';
+const BOT_VERSION = 'v19-quiz-advance';
 
 /** 9-step workflow (see processStudent + runCourseFlow). */
 function stepLog(step: number, message: string): void {
@@ -114,7 +114,24 @@ async function safePageWait(page: any, ms: number): Promise<void> {
 }
 
 // ====================== ANSWERS ======================
-const answersCache: any = {};
+/** Per-chapter columns (ምዕራፍ 1, 2, …) + optional final column (total). */
+type CourseAnswers = { chapters: string[][]; final: string[] };
+const answersCache: Record<string, CourseAnswers> = {};
+
+function chapterIndexFromHeader(header: string): number | null {
+    const h = header.trim();
+    if (/^total$/i.test(h)) return null;
+    if (!/ራፍ|chapter|መዕ|ምዕ|ምእ/i.test(h)) return null;
+    const m = h.match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : null;
+}
+
+function flatFallbackAnswers(ca: CourseAnswers): string[] {
+    for (const ch of ca.chapters) {
+        if (ch.length) return ch;
+    }
+    return ca.final.length ? ca.final : ['ለ', 'ሐ', 'መ'];
+}
 
 /** Keywords (longest first) → answers/*.csv basename */
 const courseToFileMap: { [key: string]: string } = {
@@ -218,16 +235,17 @@ function resolveAnswerFileName(courseName: string): string | null {
     return null;
 }
 
-async function loadAnswers(courseName: string): Promise<string[]> {
-    if (answersCache[courseName]?.length) return answersCache[courseName];
+async function loadCourseAnswers(courseName: string): Promise<CourseAnswers> {
+    if (answersCache[courseName]) return answersCache[courseName];
 
     const fileName = resolveAnswerFileName(courseName);
     const available = listAnswerFiles();
+    const empty: CourseAnswers = { chapters: [], final: [] };
 
     // #region agent log
     debugLog({
         hypothesisId: 'H1',
-        location: 'bot.ts:loadAnswers',
+        location: 'bot.ts:loadCourseAnswers',
         message: 'resolve answers file',
         data: { courseName, fileName, available, scores: available.map((f) => ({ f, s: scoreCourseToFile(courseName, f) })) },
     });
@@ -236,31 +254,119 @@ async function loadAnswers(courseName: string): Promise<string[]> {
     if (!fileName) {
         console.log(`⚠️ No answer file matched for course: "${courseName}"`);
         console.log(`   Available: ${available.join(', ')}`);
-        console.log(`   Exam will use default answers (ለ, ሐ, …)`);
-        return [];
+        return empty;
     }
 
     const csvPath = path.join(answersDir, `${fileName}.csv`);
     if (!fs.existsSync(csvPath)) {
         console.log(`⚠️ Answers file missing on disk: ${fileName}.csv`);
-        return [];
+        return empty;
     }
 
-    console.log(`📋 Answers loaded from: ${fileName}.csv (matched "${courseName}")`);
-
     return new Promise((resolve) => {
-        const answers: string[] = [];
+        const chapters: string[][] = [];
+        const final: string[] = [];
+        let chapterCols: { header: string; chapterIndex: number }[] = [];
+
         fs.createReadStream(csvPath)
             .pipe(csv())
+            .on('headers', (headers: string[]) => {
+                chapterCols = headers
+                    .map((h) => ({ header: h, chapterIndex: chapterIndexFromHeader(h) }))
+                    .filter((c): c is { header: string; chapterIndex: number } => c.chapterIndex != null)
+                    .sort((a, b) => a.chapterIndex - b.chapterIndex);
+            })
             .on('data', (row) => {
-                const ans = row['total'] || row['answer'] || Object.values(row)[0];
-                if (ans) answers.push(ans.toString().trim());
+                if (!chapterCols.length) {
+                    for (const key of Object.keys(row)) {
+                        const idx = chapterIndexFromHeader(key);
+                        if (idx != null) chapterCols.push({ header: key, chapterIndex: idx });
+                    }
+                    chapterCols.sort((a, b) => a.chapterIndex - b.chapterIndex);
+                }
+                for (const col of chapterCols) {
+                    const v = (row[col.header] || '').toString().trim();
+                    if (!v) continue;
+                    const arrIdx = col.chapterIndex - 1;
+                    while (chapters.length <= arrIdx) chapters.push([]);
+                    chapters[arrIdx].push(v);
+                }
+                const total = (row['total'] || row['Total'] || '').toString().trim();
+                if (total) final.push(total);
             })
             .on('end', () => {
-                answersCache[courseName] = answers;
-                resolve(answers);
+                const ca = { chapters, final };
+                answersCache[courseName] = ca;
+                const summary = chapters.map((ch, i) => `ch${i + 1}:${ch.length}`).join(', ');
+                console.log(`📋 Answers loaded from: ${fileName}.csv (${summary || 'no chapters'}; final:${final.length})`);
+                // #region agent log
+                debugLog({
+                    hypothesisId: 'Q1',
+                    runId: 'post-fix',
+                    location: 'bot.ts:loadCourseAnswers',
+                    message: 'parsed chapter columns',
+                    data: { courseName, fileName, chapterCols: chapterCols.map((c) => c.header), chapters: chapters.map((ch) => ch.slice(0, 8)), finalCount: final.length },
+                });
+                // #endregion
+                resolve(ca);
             });
     });
+}
+
+async function detectChapterNumberFromPage(page: any): Promise<number | null> {
+    for (const frame of orderFramesForScorm(page)) {
+        if (!/scormcontent/i.test(frame.url())) continue;
+        try {
+            const n = await frame.evaluate(() => {
+                const t = (document.body?.innerText || '').replace(/\s+/g, ' ');
+                const m = t.match(/(?:ምዕራፍ|መዕራፍ|ምእራፍ)\s*(\d+)/i);
+                return m ? parseInt(m[1], 10) : null;
+            });
+            if (n) return n;
+        } catch {}
+    }
+    return null;
+}
+
+async function isFinalCourseExamPage(page: any): Promise<boolean> {
+    for (const frame of orderFramesForScorm(page)) {
+        if (!/scormcontent/i.test(frame.url())) continue;
+        try {
+            const r = await frame.evaluate(() => {
+                const t = (document.body?.innerText || '').replace(/\s+/g, ' ');
+                const lesson = t.match(/Lesson\s+(\d+)\s+of\s+(\d+)/i);
+                if (lesson && lesson[1] === lesson[2]) return { isFinal: true, reason: 'last-lesson' };
+                if (/ማጠቃለያ/i.test(t) && /(?:ምዕራፍ|መዕራፍ|ምእራፍ)\s*\d+/i.test(t)) {
+                    return { isFinal: false, reason: 'chapter-summary' };
+                }
+                if (/የኮርስ.*ፈተና|course.*exam|final\s*exam/i.test(t)) return { isFinal: true, reason: 'final-text' };
+                return { isFinal: false, reason: 'default-chapter' };
+            });
+            // #region agent log
+            debugLog({ hypothesisId: 'Q2', location: 'bot.ts:isFinalCourseExamPage', message: 'exam type', data: r });
+            // #endregion
+            return r.isFinal;
+        } catch {}
+    }
+    return false;
+}
+
+function resolveExamQuizPlan(
+    ca: CourseAnswers,
+    chapterNum: number | null,
+    chapterExamsDone: number,
+    isFinal: boolean
+): { answers: string[]; label: string; maxQ: number } {
+    if (isFinal) {
+        const answers = ca.final.length ? ca.final : flatFallbackAnswers(ca);
+        return { answers, label: 'Final exam', maxQ: Math.min(Math.max(answers.length, 10), 50) };
+    }
+    const idx = chapterNum != null ? chapterNum - 1 : chapterExamsDone;
+    const chAnswers = ca.chapters[idx] || ca.chapters[chapterExamsDone] || [];
+    const answers = chAnswers.length ? chAnswers : flatFallbackAnswers(ca);
+    const label = `Chapter ${chapterNum ?? chapterExamsDone + 1} exam`;
+    const maxQ = Math.min(CHAPTER_QUIZ_MAX_Q, Math.max(answers.length, 1));
+    return { answers, label, maxQ };
 }
 
 function sortFramesByContent(frames: any[]): any[] {
@@ -393,61 +499,194 @@ async function isQuizActive(page: any): Promise<boolean> {
     return await isQuizScreen(frame);
 }
 
+/** Fingerprint active quiz slide so we know when Q1 → Q2 actually happened. */
+async function getQuizQuestionFingerprint(frame: any): Promise<string> {
+    try {
+        return await frame.evaluate(() => {
+            const isVisibleInViewport = (el: Element) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 8 || rect.height < 5) return false;
+                if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                let node: Element | null = el;
+                while (node && node !== document.documentElement) {
+                    const st = getComputedStyle(node);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    if (parseFloat(st.opacity) < 0.2) return false;
+                    const h = node as HTMLElement;
+                    if (h.offsetParent === null && st.position !== 'fixed' && node.tagName !== 'BODY' && node.tagName !== 'HTML') {
+                        return false;
+                    }
+                    node = node.parentElement;
+                }
+                return true;
+            };
+
+            const chunks: string[] = [];
+            document.querySelectorAll('h1, h2, h3, h4, p, legend, label, [class*="question"]').forEach((el) => {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t.length >= 8 && t.length < 280 && isVisibleInViewport(el)) chunks.push(t.slice(0, 100));
+            });
+            let checked = 0;
+            let visRadios = 0;
+            document.querySelectorAll('input[type="radio"]').forEach((r) => {
+                if (isVisibleInViewport(r)) {
+                    visRadios++;
+                    if ((r as HTMLInputElement).checked) checked++;
+                }
+            });
+            return `${chunks.join('§').slice(0, 400)}::c${checked}::vr${visRadios}`;
+        });
+    } catch {
+        return '';
+    }
+}
+
+async function waitForQuizQuestionAdvance(page: any, frame: any, beforeFp: string, maxMs = 10000): Promise<boolean> {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+        await safePageWait(page, 450);
+        const fp = await getQuizQuestionFingerprint(frame);
+        if (fp && fp !== beforeFp) {
+            // #region agent log
+            debugLog({
+                hypothesisId: 'Q3',
+                runId: 'post-fix',
+                location: 'bot.ts:waitForQuizQuestionAdvance',
+                message: 'quiz advanced',
+                data: { before: beforeFp.slice(0, 80), after: fp.slice(0, 80) },
+            });
+            // #endregion
+            return true;
+        }
+    }
+    // #region agent log
+    debugLog({
+        hypothesisId: 'Q3',
+        runId: 'post-fix',
+        location: 'bot.ts:waitForQuizQuestionAdvance',
+        message: 'quiz did NOT advance',
+        data: { before: beforeFp.slice(0, 120) },
+    });
+    // #endregion
+    return false;
+}
+
+async function clickVisibleQuizButton(frame: any, needles: string[]): Promise<{ ok: boolean; text: string }> {
+    try {
+        const r = await frame.evaluate((patterns: string[]) => {
+            const isVisibleInViewport = (el: Element) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 12 || rect.height < 8) return false;
+                if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                let node: Element | null = el;
+                while (node && node !== document.documentElement) {
+                    const st = getComputedStyle(node);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    if (parseFloat(st.opacity) < 0.2) return false;
+                    const h = node as HTMLElement;
+                    if (h.offsetParent === null && st.position !== 'fixed' && node.tagName !== 'BODY' && node.tagName !== 'HTML') {
+                        return false;
+                    }
+                    node = node.parentElement;
+                }
+                return true;
+            };
+
+            let best: { el: HTMLElement; score: number; text: string } | null = null;
+            for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!patterns.some((p) => t.includes(p))) continue;
+                if (!isVisibleInViewport(el)) continue;
+                const rect = el.getBoundingClientRect();
+                const area = rect.width * rect.height;
+                if (area < 80 || area > 200000) continue;
+                let score = rect.top;
+                if (/ያስገቡ/i.test(t)) score += 3000;
+                if (/ቀጣይ|ይቀጥሉ/i.test(t)) score += 2500;
+                if (!best || score > best.score) best = { el: el as HTMLElement, score, text: t };
+            }
+            if (!best) return { ok: false, text: '' };
+            best.el.scrollIntoView({ block: 'center', inline: 'center' });
+            best.el.click();
+            return { ok: true, text: best.text.slice(0, 50) };
+        }, needles);
+        return r?.ok ? r : { ok: false, text: '' };
+    } catch {
+        return { ok: false, text: '' };
+    }
+}
+
 async function clickAnswerByLetter(frame: any, answer: string): Promise<boolean> {
     const letter = answer.trim().replace(/\s+/g, '');
     if (!letter) return false;
 
-    const playwrightAttempts = [
-        () => frame.getByText(letter, { exact: true }).first().click({ force: true, timeout: 8000 }),
-        () => frame.locator('label').filter({ hasText: letter }).first().click({ force: true, timeout: 8000 }),
-        () => frame.locator(`[role="radio"]:has-text("${letter}")`).first().click({ force: true, timeout: 8000 }),
-        () => frame.locator(`button:has-text("${letter}")`).first().click({ force: true, timeout: 8000 }),
-    ];
-
-    for (let i = 0; i < playwrightAttempts.length; i++) {
-        try {
-            await playwrightAttempts[i]();
-            debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickAnswerByLetter', message: 'playwright click ok', data: { letter, attempt: i } });
-            return true;
-        } catch {}
-    }
-
     try {
         const result = await frame.evaluate((ans) => {
             const norm = ans.trim().replace(/\s+/g, '');
-            const clickables = [...document.querySelectorAll('label, button, [role="radio"], div, span, li')];
-            for (const el of clickables) {
+            const isVisibleInViewport = (el: Element) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 8 || rect.height < 5) return false;
+                if (rect.bottom < 2 || rect.top > window.innerHeight - 2) return false;
+                if (rect.right < 2 || rect.left > window.innerWidth - 2) return false;
+                let node: Element | null = el;
+                while (node && node !== document.documentElement) {
+                    const st = getComputedStyle(node);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    if (parseFloat(st.opacity) < 0.2) return false;
+                    const h = node as HTMLElement;
+                    if (h.offsetParent === null && st.position !== 'fixed' && node.tagName !== 'BODY' && node.tagName !== 'HTML') {
+                        return false;
+                    }
+                    node = node.parentElement;
+                }
+                return true;
+            };
+
+            for (const el of document.querySelectorAll('label, [role="radio"], button, span, div, li')) {
                 const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
                 if (!t || t.length > 30) continue;
-                if (t === norm || t.startsWith(norm + ' ') || t.startsWith(norm + '.') || t.startsWith(norm + ')')) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 5 && rect.height > 5) {
-                        (el as HTMLElement).click();
-                        return { ok: true, via: `label:${t}` };
-                    }
+                if ((t === norm || t.startsWith(norm + ' ') || t.startsWith(norm + '.')) && isVisibleInViewport(el)) {
+                    (el as HTMLElement).click();
+                    return { ok: true, via: `visible:${t}` };
                 }
             }
-            const radios = [...document.querySelectorAll('input[type="radio"]')].filter((r) => {
-                const rect = r.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-            });
+            const radios = [...document.querySelectorAll('input[type="radio"]')].filter(isVisibleInViewport);
             const map: Record<string, number> = {
                 'ለ': 0, 'ሀ': 0, 'A': 0, 'a': 0,
                 'ሐ': 1, 'U': 1, 'B': 1, 'b': 1,
                 'መ': 2, 'ረ': 2, 'C': 2, 'c': 2,
             };
             const idx = map[norm] ?? map[norm.charAt(0)];
-            if (idx !== undefined && radios[idx]) {
-                radios[idx].click();
-                radios[idx].closest('label')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                return { ok: true, via: `radio:${idx}` };
+            if (idx !== undefined && idx < radios.length) {
+                const radio = radios[idx] as HTMLInputElement;
+                radio.click();
+                radio.closest('label')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                return { ok: true, via: `visible-radio:${idx}` };
             }
             return { ok: false };
         }, letter);
-        return !!result?.ok;
-    } catch {
-        return false;
-    }
+        if (result?.ok) {
+            debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickAnswerByLetter', message: 'visible click ok', data: { letter, via: result.via } });
+            return true;
+        }
+    } catch {}
+
+    try {
+        const loc = frame.getByText(letter, { exact: true });
+        const count = await loc.count();
+        for (let i = 0; i < count; i++) {
+            const el = loc.nth(i);
+            if (await el.isVisible({ timeout: 600 }).catch(() => false)) {
+                await el.click({ force: true, timeout: 8000 });
+                debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickAnswerByLetter', message: 'playwright visible click ok', data: { letter, index: i } });
+                return true;
+            }
+        }
+    } catch {}
+
+    return false;
 }
 
 function answerLetterToIndex(answer: string): number {
@@ -511,52 +750,23 @@ async function selectQuizAnswer(frame: any, answer: string): Promise<boolean> {
 }
 
 async function clickNextBekuty(page: any): Promise<boolean> {
-    for (const frame of sortFramesByContent(page.frames())) {
-        for (const label of ['ይቀጥሉ', 'ቀጣይ', 'Next']) {
-            try {
-                const exact = frame.getByRole('button', { name: label, exact: true });
-                if (await exact.isVisible({ timeout: 500 })) {
-                    await exact.click({ force: true, timeout: 8000 });
-                    debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next', data: { frameUrl: frame.url(), label, method: 'role' } });
-                    return true;
-                }
-            } catch {}
-            try {
-                const btn = frame.locator(`button:has-text("${label}")`).first();
-                if (await btn.isVisible({ timeout: 500 })) {
-                    await btn.click({ force: true, timeout: 8000 });
-                    debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next', data: { frameUrl: frame.url(), label, method: 'has-text' } });
-                    return true;
-                }
-            } catch {}
-        }
-    }
-    const result = await clickTextInFrames(page, ['ይቀጥሉ', 'ቀጣይ', 'Next'], { examMode: true });
-    if (result.clicked) {
-        debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked next via frames', data: result });
+    const frame = getScormContentFrame(page);
+    if (!frame) return false;
+    const r = await clickVisibleQuizButton(frame, ['ቀጣይ', 'ይቀጥሉ', 'Next']);
+    if (r.ok) {
+        debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickNextBekuty', message: 'clicked visible next', data: { frameUrl: frame.url(), text: r.text } });
         return true;
     }
     return false;
 }
 
 async function clickSubmitYasebu(page: any): Promise<boolean> {
-    for (const frame of sortFramesByContent(page.frames())) {
-        try {
-            const exact = frame.getByRole('button', { name: 'ያስገቡ', exact: true });
-            if (await exact.isVisible({ timeout: 500 })) {
-                await exact.click({ force: true, timeout: 8000 });
-                debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickSubmitYasebu', message: 'clicked ያስገቡ', data: { frameUrl: frame.url(), method: 'role' } });
-                return true;
-            }
-        } catch {}
-        try {
-            const btn = frame.locator('button:has-text("ያስገቡ")').first();
-            if (await btn.isVisible({ timeout: 500 })) {
-                await btn.click({ force: true, timeout: 8000 });
-                debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickSubmitYasebu', message: 'clicked ያስገቡ', data: { frameUrl: frame.url(), method: 'has-text' } });
-                return true;
-            }
-        } catch {}
+    const frame = getScormContentFrame(page);
+    if (!frame) return false;
+    const r = await clickVisibleQuizButton(frame, ['ያስገቡ']);
+    if (r.ok) {
+        debugLog({ hypothesisId: 'H4', location: 'bot.ts:clickSubmitYasebu', message: 'clicked visible submit', data: { frameUrl: frame.url(), text: r.text } });
+        return true;
     }
     return false;
 }
@@ -1495,12 +1705,12 @@ async function processStudent(student: any, usedCourseIndices: Set<number>, stud
             throw new Error('Still on My courses — View Course did not open the course');
         }
 
-        const answers = await loadAnswers(courseTitle);
+        const courseAnswers = await loadCourseAnswers(courseTitle);
 
         if (await isCourseCertified(page) || (await isCourseAlreadyComplete(page))) {
             stepLog(8, 'Course already certified');
         } else {
-            await runCourseFlow(page, answers);
+            await runCourseFlow(page, courseAnswers);
         }
 
     } catch (e: any) {
@@ -1566,16 +1776,46 @@ async function answerOneQuizQuestion(
         return { ok: false, nextIndex: answerIndex };
     }
 
-    const answer = answers[answerIndex] ?? answers[answerIndex % Math.max(answers.length, 1)] ?? 'ለ';
+    if (answerIndex >= answers.length) {
+        return { ok: false, nextIndex: answerIndex };
+    }
+
+    const answer = answers[answerIndex] ?? 'ለ';
+    const beforeFp = await getQuizQuestionFingerprint(frame);
     const selected = await selectQuizAnswer(frame, answer);
     if (!selected) return { ok: false, nextIndex: answerIndex };
 
+    // #region agent log
+    debugLog({
+        hypothesisId: 'Q1',
+        location: 'bot.ts:answerOneQuizQuestion',
+        message: 'answer picked',
+        data: { label, qNum, answerIndex, answer, poolSize: answers.length, beforeFp: beforeFp.slice(0, 80) },
+    });
+    // #endregion
     console.log(`  📝 ${label} Q${qNum} → ${answer} ✓`);
-    await safePageWait(page, 400);
-    await clickSubmitYasebu(page);
     await safePageWait(page, 500);
-    await clickNextBekuty(page);
-    await safePageWait(page, 600);
+
+    if (!(await clickSubmitYasebu(page))) {
+        console.log(`   ⚠️ ${label} Q${qNum}: ያስገቡ not clicked`);
+        return { ok: false, nextIndex: answerIndex };
+    }
+    await safePageWait(page, 1200);
+
+    let advanced = await waitForQuizQuestionAdvance(page, frame, beforeFp, 5000);
+    if (!advanced) {
+        await clickNextBekuty(page);
+        await safePageWait(page, 600);
+        advanced = await waitForQuizQuestionAdvance(page, frame, beforeFp, 8000);
+    }
+    if (!advanced) {
+        await clickNextBekuty(page);
+        advanced = await waitForQuizQuestionAdvance(page, frame, beforeFp, 5000);
+    }
+    if (!advanced) {
+        console.log(`   ⚠️ ${label} Q${qNum}: UI did not advance to next question — retrying same index`);
+        return { ok: false, nextIndex: answerIndex };
+    }
 
     return { ok: true, nextIndex: answerIndex + 1 };
 }
@@ -1590,9 +1830,10 @@ async function runQuizBlock(
     let idx = startIndex;
     let answered = 0;
 
-    console.log(`   ▶️ ${label}: starting to answer up to ${maxQuestions} questions (until quiz ends)`);
+    const questionLimit = answers.length > 0 ? Math.min(maxQuestions, answers.length) : maxQuestions;
+    console.log(`   ▶️ ${label}: answer up to ${questionLimit} questions (CSV has ${answers.length})`);
 
-    for (let q = 0; q < maxQuestions; q++) {
+    for (let q = 0; q < questionLimit; q++) {
         await safePageWait(page, 700);
 
         const frame = getScormContentFrame(page);
@@ -1824,10 +2065,10 @@ async function isCourseAlreadyComplete(page: any): Promise<boolean> {
     return false;
 }
 
-/** Steps 3–8: start course → loop lessons → exams → certified. */
-async function runCourseFlow(page: any, answers: string[] = []) {
+/** Steps 3–8: start course → loop lessons → chapter exams → final exam → certified. */
+async function runCourseFlow(page: any, courseAnswers: CourseAnswers = { chapters: [], final: [] }) {
     let loop = 0;
-    let answerIndex = 0;
+    let chapterExamsDone = 0;
 
     await launchScormFromView(page);
     await waitForScormContentFrame(page, 25000);
@@ -1871,10 +2112,31 @@ async function runCourseFlow(page: any, answers: string[] = []) {
                 await safePageWait(page, 2500);
                 await waitForScormContentFrame(page, 12000);
                 if (await waitForQuizAfterExamStart(page)) {
-                    stepLog(6, 'Answer all questions (answer → ያስገቡ → ይቀጥሉ) from answers CSV');
-                    answerIndex = await runQuizBlock(page, answers, answerIndex, 50, 'Final exam');
+                    const chapterNum = await detectChapterNumberFromPage(page);
+                    const isFinal = await isFinalCourseExamPage(page);
+                    const plan = resolveExamQuizPlan(courseAnswers, chapterNum, chapterExamsDone, isFinal);
+                    // #region agent log
+                    debugLog({
+                        hypothesisId: 'Q1',
+                        runId: 'post-fix',
+                        location: 'bot.ts:runCourseFlow:examQuiz',
+                        message: 'exam answer plan',
+                        data: {
+                            loop,
+                            chapterNum,
+                            isFinal,
+                            label: plan.label,
+                            maxQ: plan.maxQ,
+                            chapterExamsDone,
+                            answersPreview: plan.answers.slice(0, 8),
+                        },
+                    });
+                    // #endregion
+                    stepLog(6, `Answer ${plan.label} (answer → ያስገቡ → ይቀጥሉ) from CSV`);
+                    await runQuizBlock(page, plan.answers, 0, plan.maxQ, plan.label);
+                    if (!isFinal) chapterExamsDone++;
                     stepLog(7, 'After test → click መማር ይቀጥሉ');
-                    await clickContinueOnce(page, 'After exam');
+                    await clickContinueOnce(page, 'After chapter exam');
                     await waitForScormContentFrame(page, 10000);
                     if (await isCourseCertified(page)) continue;
                     continue;
@@ -1890,10 +2152,11 @@ async function runCourseFlow(page: any, answers: string[] = []) {
 
         // Mid-course quiz (steps 4–6, smaller tests)
         if (scorm && inQuiz) {
-            stepLog(6, 'Mid-course quiz — answer → ያስገቡ → ይቀጥሉ');
-            const before = answerIndex;
-            answerIndex = await runQuizBlock(page, answers, answerIndex, CHAPTER_QUIZ_MAX_Q, 'Chapter test');
-            if (answerIndex > before) {
+            const chapterNum = await detectChapterNumberFromPage(page);
+            const plan = resolveExamQuizPlan(courseAnswers, chapterNum, chapterExamsDone, false);
+            stepLog(6, `Mid-course quiz (${plan.label}) — answer → ያስገቡ → ይቀጥሉ`);
+            const nextIdx = await runQuizBlock(page, plan.answers, 0, plan.maxQ, plan.label);
+            if (nextIdx > 0) {
                 stepLog(7, 'After quiz → መማር ይቀጥሉ');
                 await clickContinueOnce(page, 'After chapter test');
                 if (await waitForExamStartButton(page, 12000)) {
